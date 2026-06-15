@@ -41,6 +41,9 @@ fn panic(panic_info: &core::panic::PanicInfo) -> ! {
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+// Panel geometry and color depth. PLANES trades color depth against refresh rate.
+// KEEP IN SYNC: docs/performance.md tabulates the measured rates and tuning math for
+// these values — update it if you change PLANES or the panel size.
 const ROWS: usize = 64;
 const COLS: usize = 64;
 const NROWS: usize = compute_rows(ROWS);
@@ -191,7 +194,9 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
     info!("Embassy initialized!");
 
-    // HUB75 wiring (matches the wiring table; the "GND"-silked pin 12 is D).
+    // HUB75 wiring (the "GND"-silked pin 12 is actually the D address line).
+    // KEEP IN SYNC: docs/hardware-wiring.md holds the full pin map and the rationale
+    // for these GPIO choices — update both together if you re-wire.
     let pins = Hub75Pins16 {
         red1: peripherals.GPIO19.degrade(),
         grn1: peripherals.GPIO20.degrade(),
