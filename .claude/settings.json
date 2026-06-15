@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.waveshare.com)",
+      "Bash(cargo build *)",
+      "WebFetch(domain:docs.espressif.com)"
+    ]
+  }
+}
