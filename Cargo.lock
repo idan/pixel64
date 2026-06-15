@@ -1122,6 +1122,7 @@ version = "0.1.0"
 dependencies = [
  "critical-section",
  "embassy-executor",
+ "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-graphics",
  "esp-bootloader-esp-idf",
@@ -1129,6 +1130,7 @@ dependencies = [
  "esp-hub75",
  "esp-println",
  "esp-rtos",
+ "heapless 0.9.3",
  "log",
  "static_cell",
 ]
