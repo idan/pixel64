@@ -92,10 +92,54 @@ clean split for ribbon routing.
 
 ## Power
 
-- The panel needs its **own 5 V supply, up to ~4 A** at full white. Feed it through
-  the panel's dedicated power connector (the screw/JST terminals), **not** through
-  the dev board.
-- **Never** route the panel's LED current through the ESP32-C6 board.
+- The panel needs **5 V at up to ~4 A** at full white. Feed it through the panel's
+  dedicated power connector (the screw/JST terminals), **not** through the dev board.
+- **Never** route the panel's LED current through the MCU board. The MCU only taps a
+  small branch off the same rail (see below); the amps go straight from the PSU to the
+  panel's power lugs.
+
+### One supply for the whole device (finished packaging)
+
+Goal: **one power cable from the wall to the finished unit.** Both the panel and the
+MCU run on 5 V, so you split a single 5 V rail:
+
+```
+            ┌──────────────► panel power terminals (fat red/black leads)
+5 V PSU ────┤
+            └──► MCU 5 V input  +  GND
+```
+
+- **Pico 2 W (the planned target board):** feed the 5 V rail into **VSYS (pin 39)**,
+  GND to any GND pin. VSYS accepts **1.8–5.5 V** and feeds the onboard buck-boost that
+  generates 3.3 V for the RP2350 and the WiFi chip — so raw 5 V here is exactly its
+  intended use.
+  - The Pico has an onboard Schottky (D1) between VBUS and VSYS. If **only** the
+    external 5 V is connected in normal operation (no USB), wire VSYS directly. If you
+    want to plug in **USB for flashing/debug while the external supply is live**, either
+    unplug the supply first, or add your own Schottky between the 5 V rail and VSYS (the
+    datasheet's "two sources" arrangement) so the sources don't fight.
+- **ESP32-C6 DevKitM-1 (current bench board):** feed 5 V into the **5V0 / VBUS** pin and
+  GND. (For a sealed product the Pico is the intended board; this is just for bench use.)
+
+### Sizing & rail hygiene
+
+- The panel's **4 A is its own worst case** (full white, full brightness), not
+  panel-plus-everything. The MCU adds only ~50–150 mA, with brief higher peaks when the
+  WiFi radio transmits — rounding error, but it eats into already-thin margin since full
+  white sits near the edge of a 4 A supply.
+- For a one-cable finished build, use **5 V / 5 A (or 6 A)** for clean headroom, and/or
+  **cap brightness in firmware** so you never approach full-white max draw (you want a
+  brightness cap anyway — full brightness is blinding and runs hot).
+- **Prefer the headroom — the current rating is a ceiling, not a draw.** The load pulls
+  what it pulls; a 6 A supply doesn't push 6 A or waste more as heat (losses track the
+  *actual* load, and both 5 A and 6 A sit in the efficient part of the curve at our
+  ~3.5 A draw — a percent or two apart at most). The bigger supply buys **lower operating
+  temperature** (≈ longer cap life — the usual first thing to die), and a **stiffer rail
+  under transients** (panel row-switching + WiFi TX peaks), which directly helps the
+  brownout/flicker problem. No power penalty for sizing up.
+- Add a **bulk electrolytic (≥1000 µF) across the 5 V rail near the panel** to absorb the
+  current spikes as rows switch. HUB75 panels are electrically noisy; WiFi TX peaks on a
+  sagging shared rail are a classic cause of brownout resets and flicker.
 
 ## Common ground (required)
 
