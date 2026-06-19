@@ -1,9 +1,16 @@
 # pixel64 — project context
 
-An **ESP32-C6-DevKitM-1** driving a **Waveshare P3 64×64 HUB75** LED matrix, in **Rust
-(esp-hal 1.1 + Embassy, no_std)**. Goal: an internet-connected pixel display.
+Monorepo for an internet-connected **64×64 HUB75 LED pixel display**:
 
-## Current state
+- **`firmware/`** — the device: an **ESP32-C6-DevKitM-1** driving a **Waveshare P3 64×64 HUB75**
+  panel, in **Rust (esp-hal 1.1 + Embassy, no_std)**. All Cargo/build/docs for the device live here.
+- **`web/`** — (planned) the cloud backend + web UI: **Svelte 5 / SvelteKit on Cloudflare**, tooled
+  with **Bun**. Not scaffolded yet.
+
+Repo root holds only shared bits (this file, `.claude/`, `.gitignore`). **Run firmware commands from
+`firmware/`** (e.g. `cd firmware && cargo run`).
+
+## Current state (firmware)
 
 - ✅ **Display** — esp-hub75 over PARL_IO + DMA, double-buffered, ~520 Hz, embedded-graphics.
 - ✅ **Wi-Fi onboarding** — first-run provisioning via **Improv over BLE**. Provision from Chrome
@@ -14,10 +21,10 @@ An **ESP32-C6-DevKitM-1** driving a **Waveshare P3 64×64 HUB75** LED matrix, in
 
 ## Read before working
 
-- **[docs/gotchas.md](docs/gotchas.md)** — hard-won subtleties, dependency landmines, the BLE
-  debugging playbook, and the macOS/flicker conclusions. **Read this before debugging.**
-- [docs/README.md](docs/README.md) — docs index. Also: hardware-wiring, firmware, performance,
-  wifi-onboarding.
+- **[firmware/docs/gotchas.md](firmware/docs/gotchas.md)** — hard-won subtleties, dependency
+  landmines, the BLE debugging playbook, and the macOS/flicker conclusions. **Read before debugging.**
+- [firmware/docs/README.md](firmware/docs/README.md) — docs index. Also: hardware-wiring, firmware,
+  performance, wifi-onboarding.
 
 ## Constraints you should NOT relearn the hard way
 
@@ -29,9 +36,9 @@ An **ESP32-C6-DevKitM-1** driving a **Waveshare P3 64×64 HUB75** LED matrix, in
 - **macOS Chrome BLE provisioning does not work** (esp-radio ↔ CoreBluetooth link-layer issue,
   not our code) — provision from Android. iOS never works (no Web Bluetooth).
 - Pin map quirks: HUB75 `D` is the silk-"GND" pin 12; `B` is on GPIO14 (GPIO8 is the onboard LED);
-  GPIO10/11 aren't broken out. See docs/hardware-wiring.md.
+  GPIO10/11 aren't broken out. See firmware/docs/hardware-wiring.md.
 
 ## Build / run
 
-`cargo run` flashes + monitors (espflash, `riscv32imac-unknown-none-elf`). `cargo build` /
-`cargo clippy` to check (both currently clean).
+From **`firmware/`**: `cargo run` flashes + monitors (espflash, `riscv32imac-unknown-none-elf`);
+`cargo build` / `cargo clippy` to check (both currently clean).

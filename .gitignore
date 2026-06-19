@@ -24,3 +24,14 @@ target/
 
 # Ignore .DS_Store file in mac
 **/.DS_Store
+
+# --- web/ (SvelteKit / Bun / Cloudflare) ---
+node_modules/
+.svelte-kit/
+.wrangler/
+.cloudflare/
+.output/
+# local env / secrets (keep an .env.example committed)
+.env
+.env.*
+!.env.example
