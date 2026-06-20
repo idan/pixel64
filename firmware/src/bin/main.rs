@@ -1,40 +1,46 @@
 //! pixel64 — RP2350 / Pico 2 W.
 //!
-//! Bring-up milestone 2a: cyw43 Wi-Fi STA join + DHCP — the device gets online and shows its IP
-//! (like the ESP build did), proving the radio's Wi-Fi path on the new HAL. Credentials come from
-//! the `WIFI_SSID` / `WIFI_PASS` compile-time env vars so nothing secret lands in the repo:
-//!
-//!     env WIFI_SSID="YourNetwork" WIFI_PASS="yourpassword" cargo run
-//!
-//! Status is logged over USB-serial; a solid onboard LED means online. See docs/pico-port.md.
+//! Bring-up milestone 2b: BLE peripheral on the cyw43 radio via trouble-host. Proves the BLE
+//! controller swap (esp-radio BleConnector → cyw43 BtDriver, both behind bt-hci's
+//! ExternalController) independently of the Improv logic. Advertises as `pixel64` with a battery
+//! service — connect with a BLE scanner (nRF Connect / LightBlue) to verify. Wi-Fi join (M2a) is
+//! intentionally dropped here to isolate BLE; M2c brings both back together with the Improv port
+//! and the concurrency test. See docs/pico-port.md.
 
 #![no_std]
 #![no_main]
+// trouble's #[gatt_service] macro expands to code with redundant borrows on each characteristic.
+#![allow(clippy::needless_borrows_for_generic_args)]
 
-use cyw43::JoinOptions;
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
-use embassy_net::{Config as NetConfig, Runner as NetRunner, StackResources};
+use embassy_futures::select::{select, Either};
 use embassy_rp::bind_interrupts;
-use embassy_rp::clocks::RoscRng;
 use embassy_rp::dma::{Channel, InterruptHandler as DmaInterruptHandler};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
-use embassy_time::Timer;
 use log::{info, warn};
 use static_cell::StaticCell;
+use trouble_host::prelude::*;
 
-// Wi-Fi credentials, baked at compile time from env vars (kept out of source/git). See module docs.
-const WIFI_SSID: &str = env!(
-    "WIFI_SSID",
-    "WIFI_SSID not set — build with: env WIFI_SSID=… WIFI_PASS=… cargo run"
-);
-const WIFI_PASS: &str = env!(
-    "WIFI_PASS",
-    "WIFI_PASS not set — build with: env WIFI_SSID=… WIFI_PASS=… cargo run"
-);
+const DEVICE_NAME: &str = "pixel64";
+const CONNECTIONS_MAX: usize = 1;
+const L2CAP_CHANNELS_MAX: usize = 2;
+
+/// Minimal GATT server: a standard Battery Service so the device shows up recognizably in a BLE
+/// scanner. (M2c replaces this with the Improv service.)
+#[gatt_server]
+struct Server {
+    battery: BatteryService,
+}
+
+#[gatt_service(uuid = "0000180f-0000-1000-8000-00805f9b34fb")]
+struct BatteryService {
+    #[characteristic(uuid = "00002a19-0000-1000-8000-00805f9b34fb", read, notify)]
+    level: u8,
+}
 
 // Program metadata for `picotool info`. The embassy-rp `binary-info` feature emits the RP2350 boot
 // image-def block (.start_block) on its own, so no manual `ImageDef` is needed.
@@ -73,12 +79,6 @@ async fn cyw43_task(
     runner.run().await
 }
 
-/// Drives the embassy-net IP stack (DHCP, etc.). Runs forever.
-#[embassy_executor::task]
-async fn net_task(mut runner: NetRunner<'static, cyw43::NetDriver<'static>>) -> ! {
-    runner.run().await
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -87,16 +87,16 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
     spawner.spawn(logger_task(driver).unwrap());
 
-    info!("pixel64: bringing up cyw43 radio…");
+    info!("pixel64: bringing up cyw43 radio (Wi-Fi + BT)…");
 
-    // cyw43 firmware blobs (vendored). `fw` + `nvram` need 4-byte alignment (aligned_bytes!);
-    // `clm` is passed to control.init() as a plain slice.
+    // cyw43 firmware blobs (vendored). `fw`/`btfw`/`nvram` need 4-byte alignment (aligned_bytes!);
+    // `clm` is passed to control.init() as a plain slice. `btfw` is the Bluetooth firmware.
     let fw = cyw43::aligned_bytes!("../../cyw43-firmware/43439A0.bin");
+    let btfw = cyw43::aligned_bytes!("../../cyw43-firmware/43439A0_btfw.bin");
     let nvram = cyw43::aligned_bytes!("../../cyw43-firmware/nvram_rp2040.bin");
     let clm: &[u8] = include_bytes!("../../cyw43-firmware/43439A0_clm.bin");
 
-    // CYW43439 on GP23 (power) + PIO-emulated SPI on GP24/25/29 — fixed by the board wiring (see
-    // docs/pico-pinout.md). PIO0 + DMA_CH0 are dedicated to it.
+    // CYW43439 on GP23 (power) + PIO-emulated SPI on GP24/25/29 (see docs/pico-pinout.md).
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
     let Pio {
@@ -118,55 +118,98 @@ async fn main(spawner: Spawner) {
 
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
-    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    // new_with_bluetooth: same runner drives Wi-Fi + BT; bt_device is the bt-hci transport.
+    let (_net_device, bt_device, mut control, runner) =
+        cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw, nvram).await;
     spawner.spawn(cyw43_task(runner).unwrap());
     control.init(clm).await;
-    info!("pixel64: cyw43 up");
+    info!("pixel64: cyw43 up — starting BLE peripheral");
 
-    // IP stack (DHCP) over the cyw43 network device.
-    let seed = RoscRng.next_u64();
-    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
-    let (stack, net_runner) = embassy_net::new(
-        net_device,
-        NetConfig::dhcpv4(Default::default()),
-        RESOURCES.init(StackResources::new()),
-        seed,
-    );
-    spawner.spawn(net_task(net_runner).unwrap());
+    run_ble(bt_device).await
+}
 
-    // Join (retry on failure — wrong password / AP not yet up / out of range).
-    info!("pixel64: joining Wi-Fi '{}'…", WIFI_SSID);
+/// Bring up the trouble-host stack on cyw43's BT transport and serve the GATT peripheral forever.
+async fn run_ble(bt_device: cyw43::bluetooth::BtDriver<'static>) -> ! {
+    let controller: ExternalController<_, 1> = ExternalController::new(bt_device);
+    let address = Address::random([0xf0, 0x64, 0x1a, 0x05, 0x8f, 0xff]);
+    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
+        HostResources::new();
+    let stack = trouble_host::new(controller, &mut resources).set_random_address(address);
+    let Host {
+        mut peripheral,
+        mut runner,
+        ..
+    } = stack.build();
+
+    let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+        name: DEVICE_NAME,
+        appearance: &appearance::power_device::GENERIC_POWER_DEVICE,
+    }))
+    .unwrap();
+    let _ = server.set(&server.battery.level, &100u8);
+
+    match select(runner.run(), advertise_loop(&mut peripheral, &server)).await {
+        Either::First(_) => panic!("pixel64: BLE runner stopped"),
+        Either::Second(never) => never,
+    }
+}
+
+/// Advertise connectably, accept a client, log GATT activity until it disconnects, then re-advertise.
+async fn advertise_loop(
+    peripheral: &mut Peripheral<'_, ExternalController<cyw43::bluetooth::BtDriver<'static>, 1>, DefaultPacketPool>,
+    server: &Server<'_>,
+) -> ! {
+    let mut adv_data = [0u8; 31];
+    let adv_len = AdStructure::encode_slice(
+        &[
+            AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
+            AdStructure::CompleteLocalName(DEVICE_NAME.as_bytes()),
+        ],
+        &mut adv_data[..],
+    )
+    .unwrap();
+    let params = AdvertisementParameters::default();
+
     loop {
-        match control
-            .join(WIFI_SSID, JoinOptions::new(WIFI_PASS.as_bytes()))
+        info!("pixel64: advertising as '{}'", DEVICE_NAME);
+        let advertiser = peripheral
+            .advertise(
+                &params,
+                Advertisement::ConnectableScannableUndirected {
+                    adv_data: &adv_data[..adv_len],
+                    scan_data: &[],
+                },
+            )
             .await
-        {
-            Ok(()) => {
-                info!("pixel64: associated — waiting for DHCP…");
-                break;
-            }
+            .unwrap();
+        let conn = match advertiser.accept().await {
+            Ok(c) => match c.with_attribute_server(server) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    warn!("pixel64: attribute server error: {:?}", e);
+                    continue;
+                }
+            },
             Err(e) => {
-                warn!("pixel64: join failed ({:?}); retrying in 2s", e);
-                Timer::after_secs(2).await;
+                warn!("pixel64: accept error: {:?}", e);
+                continue;
+            }
+        };
+        info!("pixel64: BLE client connected");
+        loop {
+            match conn.next().await {
+                GattConnectionEvent::Disconnected { reason } => {
+                    info!("pixel64: BLE client disconnected: {:?}", reason);
+                    break;
+                }
+                GattConnectionEvent::Gatt { event } => {
+                    // Acknowledge reads/writes so the client sees a working GATT server.
+                    if let Ok(reply) = event.accept() {
+                        reply.send().await;
+                    }
+                }
+                _ => {}
             }
         }
-    }
-
-    stack.wait_config_up().await;
-    let ip = stack
-        .config_v4()
-        .expect("ipv4 config present after wait_config_up")
-        .address
-        .address();
-    info!("pixel64: ONLINE — ip = {}", ip);
-
-    // Solid onboard LED = online.
-    control.gpio_set(0, true).await;
-
-    let mut tick: u32 = 0;
-    loop {
-        info!("pixel64: online at {} — tick {}", ip, tick);
-        tick = tick.wrapping_add(1);
-        Timer::after_secs(5).await;
     }
 }

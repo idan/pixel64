@@ -33,16 +33,78 @@ embassy stack use **embassy-sync 0.8** uniformly. No more pinning.
 | `embassy-executor` | `0.10` | `arch-cortex-m`, `executor-thread` (+ `executor-interrupt` if we use core1) |
 | `embassy-net` | `0.9` | **same crate we already use** — ports cleanly |
 | `embassy-time` | `0.5` | |
-| `embassy-sync` | `0.8` | **no longer pinned** (esp-radio's 0.7 constraint is gone) |
+| `embassy-sync` | `0.7` **+** `0.8` | split is back via BLE — `0.7` (direct dep) for trouble's gatt macros, `0.8` for the rest; see §"Dependency compatibility" |
 | `cyw43` | `0.7` | Wi-Fi **and** BLE for the CYW43439; `new_with_bluetooth()` yields net + BT + control + runner |
 | `cyw43-pio` | `0.10` | drives the CYW43439 over PIO-emulated SPI; use `RM2_CLOCK_DIVIDER` |
-| `trouble-host` | `0.7` | the Improv GATT code ports from 0.6; expect minor API drift |
-| `bt-hci` | `0.9` | `ExternalController` wrapper (transitive via trouble-host) |
+| `trouble-host` | `0.6` | pinned to match cyw43's bt-hci 0.8 (not 0.7); Improv GATT ports ~verbatim from the ESP build |
+| `bt-hci` | `0.8` | `ExternalController` wrapper (transitive via trouble-host); must match cyw43 |
 | `sequential-storage` | `7.2` | **our v7 code ports directly** |
 | `embedded-graphics` | `0.8` | unchanged |
 | `cortex-m-rt` | `0.7` | replaces the esp boot/runtime |
 | `embassy-usb` / `embassy-usb-logger` | `0.6` | **chosen logging path** — `log::info!` over USB-CDC serial, no probe (keeps the ESP firmware's `log` API; no defmt) |
 | ~~`esp-alloc`~~ | — | **dropped** — embassy-rp + cyw43 + embassy-net + trouble-host are fully static / no-heap |
+
+### Dependency compatibility: the bt-hci / embassy-sync split (and how to retire it)
+
+**Correction to the simplification above.** Dropping esp-radio removes the embassy-sync split *only
+if you don't use BLE*. Bringing BLE in over crates.io drags it back, because of a hard constraint:
+
+> **cyw43 and trouble-host must agree on the `bt-hci` major version.** cyw43's `BtDriver` implements
+> `bt-hci`'s `Transport`; trouble-host's `ExternalController` wraps that *same* `bt-hci`'s
+> `Transport`/`Controller`. If the two crates resolve to different `bt-hci` majors, the types don't
+> line up and `ExternalController::new(bt_driver)` won't compile.
+
+State of the crates.io releases (verified mid-2026):
+
+| crate | bt-hci | embassy-sync |
+|-------|--------|--------------|
+| `cyw43` 0.7.0 | **0.8** | 0.8 |
+| `trouble-host` 0.6.0 | **0.8** ✓ | **0.7** |
+| `trouble-host` 0.7.0 | 0.9 ✗ | 0.8 |
+
+No single crates.io pair is aligned on **both** axes. We pair **cyw43 0.7.0 + trouble-host 0.6.0**
+(aligned on bt-hci 0.8 — this compiles), and pay for it with an **embassy-sync split**: trouble 0.6
+pulls embassy-sync **0.7**, the rest of the stack uses **0.8**, and they coexist as two compiled
+versions. We add a direct `embassy-sync = "0.7"` dep so the trouble `#[gatt_server]` /
+`#[gatt_service]` macros expand against the same 0.7 that trouble was built with. (This is exactly
+the arrangement the ESP build used; it's a known, working quirk — not a bug.)
+
+**How to check whether a future release lets us delete the split** — the goal is one `bt-hci` and one
+`embassy-sync` (0.8) across the whole graph:
+
+1. Pick the cyw43 version you want (usually latest). Read its `bt-hci` and `embassy-sync`
+   requirements: `cargo info cyw43@<ver>` or look at `[dependencies.bt-hci]` /
+   `[dependencies.embassy-sync]` in its `Cargo.toml`.
+2. Find a `trouble-host` version whose `bt-hci` major **equals cyw43's** *and* whose `embassy-sync`
+   major **equals the rest of the embassy stack's** (0.8). List all trouble versions + their reqs
+   straight from the index cache:
+   ```sh
+   python3 - <<'PY'
+   import re
+   raw=open(__import__('glob').glob('/Users/*/.cargo/registry/index/*/.cache/tr/ou/trouble-host')[0],
+            encoding='utf-8',errors='ignore').read()
+   starts=[m.start() for m in re.finditer(r'\{"name":"trouble-host","vers":', raw)]+[len(raw)]
+   for a,b in zip(starts,starts[1:]):
+       seg=raw[a:b]; v=re.search(r'"vers":"([^"]+)"',seg).group(1)
+       req=lambda n:(re.search(r'\{"name":"%s"[^}]*?"req":"([^"]+)"'%n,seg) or [None,'-'])[1]
+       print(f"{v:8} bt-hci={req('bt-hci'):8} embassy-sync={req('embassy-sync')}")
+   PY
+   ```
+   (run `cargo update -p trouble-host --dry-run` or any fetch first so the cache is current.)
+3. If such a version exists, the most likely trigger is **a cyw43 release that moves to bt-hci 0.9**
+   (matching trouble 0.7) — then cyw43 + trouble 0.7 align on bt-hci 0.9 *and* both sit on
+   embassy-sync 0.8.
+4. **Verify before committing:** bump the versions, delete the `embassy-sync = "0.7"` line,
+   `cargo build`, and confirm the graph collapsed:
+   ```sh
+   grep -c 'name = "bt-hci"' Cargo.lock        # want: 1
+   grep -A1 'name = "embassy-sync"' Cargo.lock # want: a single 0.8.x
+   ```
+   If both hold and the build is clean, the split is gone — update this table and drop the pin.
+
+The git-pinned `[patch]` route (embassy/trouble `main` at one rev, where everything already aligns on
+bt-hci 0.9 + embassy-sync 0.8) is the other way to a no-split stack; we chose the crates.io pairing
+to keep the working baseline on pinned releases (see *Decisions*).
 
 **Reference to track:** the trouble repo ships an official Pico 2 W example —
 `embassy-rs/trouble/examples/rp-pico-2-w/` (`ble_bas_peripheral.rs`) — with a working
@@ -167,9 +229,11 @@ plan.
    - **2a — Wi-Fi STA join** ✅ *(done — commit e4b0bac)* — embassy-net DHCP over the cyw43
      NetDriver, `control.join()`, online + IP on serial, solid LED. Creds via `WIFI_SSID`/
      `WIFI_PASS` compile-time env vars (Improv replaces this later).
-   - **2b — BLE controller swap** — `cyw43::new_with_bluetooth` (+ `bluetooth` feature + the
-     `43439A0_btfw.bin` blob) → `BtDriver` in trouble-host's `ExternalController`; advertise a
-     minimal GATT, connect from a phone/Chrome. Proves the controller swap (trouble 0.6→0.7).
+   - **2b — BLE controller swap** ✅ *(done)* — `cyw43::new_with_bluetooth` (+ `bluetooth` feature +
+     `43439A0_btfw.bin` blob) → `BtDriver` in trouble-host 0.6's `ExternalController`; advertises
+     `pixel64` with a battery service. Verified on hardware (nRF Connect connects + reads). Pairing
+     is cyw43 0.7 + trouble 0.6 on bt-hci 0.8 — see §"Dependency compatibility". The ESP `improv.rs`
+     GATT patterns ported verbatim (still trouble 0.6).
    - **2c — Spike Risk 2 (concurrency)** — port the Improv GATT, then Wi-Fi-join while a BLE
      central holds the link; verify notifications survive. Test macOS Chrome here too. Decide on the
      provisioning-flow fallback if needed.
