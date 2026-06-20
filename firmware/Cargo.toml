@@ -23,6 +23,11 @@ embassy-rp = { version = "0.10.0", features = [
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
 embassy-time     = "0.5.1"
 
+# CYW43439 radio (Wi-Fi now, BLE at the spike), driven over PIO-emulated SPI. Firmware blobs are
+# vendored in cyw43-firmware/. BLE via `new_with_bluetooth` gets enabled at the BLE-spike milestone.
+cyw43     = "0.7.0"
+cyw43-pio = "0.10.0"
+
 # USB-serial logging: one USB cable carries both flashing (BOOTSEL UF2) and `log` output — no
 # debug probe. Keeps the `log::info!` API the ESP firmware used (no defmt). See docs/pico-port.md.
 embassy-usb        = "0.6.0"
