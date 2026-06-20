@@ -163,8 +163,16 @@ plan.
    DMA_CH0), Wi-Fi firmware blob uploaded, onboard LED blinking via `control.gpio_set(0, …)`.
    Verified on hardware. cyw43-firmware/ blobs vendored (incl. the BT fw for M2). Confirms the
    radio chip + firmware blobs + PIO-SPI link all work.
-2. **Spike Risk 2** — Wi-Fi join while a BLE central holds the GATT link; verify notifications
-   survive. Test macOS Chrome here too. Decide on the provisioning-flow fallback if needed.
+2. **Wi-Fi + BLE.**
+   - **2a — Wi-Fi STA join** ✅ *(done — commit e4b0bac)* — embassy-net DHCP over the cyw43
+     NetDriver, `control.join()`, online + IP on serial, solid LED. Creds via `WIFI_SSID`/
+     `WIFI_PASS` compile-time env vars (Improv replaces this later).
+   - **2b — BLE controller swap** — `cyw43::new_with_bluetooth` (+ `bluetooth` feature + the
+     `43439A0_btfw.bin` blob) → `BtDriver` in trouble-host's `ExternalController`; advertise a
+     minimal GATT, connect from a phone/Chrome. Proves the controller swap (trouble 0.6→0.7).
+   - **2c — Spike Risk 2 (concurrency)** — port the Improv GATT, then Wi-Fi-join while a BLE
+     central holds the link; verify notifications survive. Test macOS Chrome here too. Decide on the
+     provisioning-flow fallback if needed.
 3. **Spike Risk 1** — minimal PIO+DMA HUB75 driver lighting the 64×64 panel with a test pattern
    (port the PIO program; prove DMA chain + BCM). The riskiest *build*.
 4. **Port `storage.rs`** — swap flash handle, fixed offset. Smallest, self-contained; do it early.
