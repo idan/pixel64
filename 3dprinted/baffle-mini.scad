@@ -12,10 +12,16 @@
 /* ---------------- parameters ---------------- */
 pitch  = 3;     // LED pixel pitch (mm)  -> cell size
 n      = 10;    // cells per side in this test swatch
-wall   = 0.45;  // internal wall thickness (mm). A hair over the 0.4mm nozzle so
-                // the slicer reliably lays one solid perimeter (a true 0.4 == the
-                // line width gets dropped unless "Detect thin wall" is on).
-height = 5;     // wall height in Z (mm)
+wall   = 0.42;  // internal wall thickness (mm) == the single printed line width.
+                // Under Arachne (Bambu Studio default) each wall is one perimeter
+                // whose width is set to fill this value, so this number *is* the
+                // printed line. 0.40 (= nozzle) is the floor; 0.42 keeps one clean
+                // line with a hair of margin. Set the slicer's wall line width to
+                // match, and CALIBRATE FLOW or it prints fat regardless.
+height = 3;     // wall height in Z (mm). Tuned against the real panel + diffuser:
+                // 5mm over-isolated and blocked too much off-axis light; ~2.5-3mm
+                // gives clean per-pixel cells. Lower height also prints easier
+                // (7:1 aspect at 0.42 wall vs 12:1 at 5mm).
 border = 0.8;   // thickness of the bottom/left reference walls (mm)
 
 span = n * pitch;            // 30 mm
