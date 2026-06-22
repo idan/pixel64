@@ -1,26 +1,30 @@
-//! Improv Wi-Fi provisioning over BLE (https://www.improv-wifi.com/ble/).
+//! Improv Wi-Fi provisioning over BLE (https://www.improv-wifi.com/ble/), on the cyw43 radio.
 //!
 //! In setup mode the device advertises the Improv GATT service as `pixel64`. A browser
-//! (Chrome/Edge on desktop or Android — not iOS, which lacks Web Bluetooth) connects, and the
-//! user submits their home SSID/password. We auto-authorize (no physical button gate), attempt
-//! the Wi-Fi connection while BLE stays up (so we can report status), persist on success, and
-//! return the assigned IP. The display shows live status throughout.
+//! (Chrome/Edge on desktop or Android — not iOS, which lacks Web Bluetooth) connects and the user
+//! submits their home SSID/password. We auto-authorize (no physical button gate), then join Wi-Fi
+//! **while the BLE link stays up** (so we can report status), and return the assigned IP.
 //!
-//! Wi-Fi is brought up *lazily* — only once credentials arrive — so the BLE discovery/entry
-//! phase runs with the radio uncontended (no Wi-Fi/coex starving the GATT stack or the display).
+//! This is the trouble-host 0.6 GATT code ported from the ESP build essentially verbatim — only
+//! the BLE controller (esp-radio `BleConnector` → cyw43 `BtDriver`) and the Wi-Fi path changed.
+//! On the cyw43 there's a single radio: `control` joins Wi-Fi, `bt_device` is the BLE transport,
+//! and the embassy-net `Stack` is created up front — so the ESP's lazy-radio `NetSource` dance is
+//! gone, and joining Wi-Fi while BLE is connected is the very concurrency we're spiking here.
+//!
+//! NOTE (M2c spike): credential persistence is stubbed — storage is milestone M4. See
+//! docs/pico-port.md.
 
-// trouble's `#[gatt_service]` macro expands to code with redundant borrows on each characteristic.
+// trouble's #[gatt_service] macro expands to code with redundant borrows on each characteristic.
 #![allow(clippy::needless_borrows_for_generic_args)]
 
 use core::fmt::Write as _;
 use core::net::Ipv4Addr;
 
-use embassy_executor::Spawner;
+use cyw43::bluetooth::BtDriver;
+use cyw43::Control;
 use embassy_futures::select::{select, Either};
 use embassy_net::Stack;
 use embassy_time::Duration;
-use esp_radio::ble::controller::BleConnector;
-use esp_radio::wifi::WifiController;
 use heapless::{String, Vec};
 use log::{info, warn};
 use trouble_host::prelude::*;
@@ -30,6 +34,9 @@ use crate::net;
 use crate::storage::{CredStore, Credentials};
 
 pub const DEVICE_NAME: &str = "pixel64";
+
+/// The BLE controller type: cyw43's BT transport behind bt-hci's ExternalController.
+type BleController = ExternalController<BtDriver<'static>, 1>;
 
 // Improv current-state values.
 const STATE_AUTHORIZED: u8 = 0x02;
@@ -49,50 +56,6 @@ const IMPROV_UUID_LE: [u8; 16] = [
 
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 2;
-
-/// Where the Wi-Fi station comes from. `Lazy` defers radio bring-up until the first credential
-/// attempt (keeping BLE setup radio-clean); `Ready` reuses a stack from a failed boot attempt.
-pub enum NetSource {
-    Lazy {
-        wifi: esp_hal::peripherals::WIFI<'static>,
-        spawner: Spawner,
-    },
-    Ready {
-        wifi: WifiController<'static>,
-        stack: Stack<'static>,
-    },
-}
-
-/// Holds the (possibly not-yet-started) Wi-Fi stack and the credential store across attempts.
-struct Provisioner<'a> {
-    source: Option<NetSource>,
-    store: &'a mut CredStore,
-}
-
-impl Provisioner<'_> {
-    /// Ensure Wi-Fi is up, then connect with the given credentials. Returns the assigned IP.
-    async fn connect(&mut self, ssid: &str, password: &str) -> Result<Ipv4Addr, ()> {
-        let (mut wifi, stack) = match self.source.take() {
-            Some(NetSource::Ready { wifi, stack }) => (wifi, stack),
-            Some(NetSource::Lazy { wifi, spawner }) => {
-                info!("[improv] starting Wi-Fi for the first connection attempt");
-                match net::start(wifi, spawner) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        warn!("[improv] Wi-Fi start failed: {:?}", e);
-                        return Err(());
-                    }
-                }
-            }
-            None => return Err(()),
-        };
-
-        let result = net::connect(&mut wifi, &stack, ssid, password).await;
-        // Keep the started stack for any retry.
-        self.source = Some(NetSource::Ready { wifi, stack });
-        result.map_err(|e| warn!("[improv] connect failed: {:?}", e))
-    }
-}
 
 #[gatt_server]
 struct Server {
@@ -114,27 +77,27 @@ struct ImprovService {
     capabilities: u8,
 }
 
-/// Run setup mode until the user provisions Wi-Fi. Returns the live Wi-Fi controller + stack
-/// (so the caller keeps them alive) and the assigned IP; credentials are already saved.
+/// Run setup mode until the user provisions Wi-Fi; returns the assigned IP. The BLE link stays up
+/// across the Wi-Fi join so status notifications reach the Improv client.
 pub async fn run_setup(
-    controller: ExternalController<BleConnector<'static>, 1>,
-    net_source: NetSource,
+    bt_device: BtDriver<'static>,
+    control: &mut Control<'static>,
+    stack: Stack<'static>,
     store: &mut CredStore,
-) -> (WifiController<'static>, Stack<'static>, Ipv4Addr) {
-    let mut prov = Provisioner {
-        source: Some(net_source),
-        store,
-    };
-
+) -> Ipv4Addr {
+    let controller: BleController = ExternalController::new(bt_device);
     let address = Address::random([0xf0, 0x64, 0x1a, 0x05, 0x8f, 0xff]);
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();
-    let host = trouble_host::new(controller, &mut resources).set_random_address(address);
+    // `build()` borrows the stack, so `ble_stack` stays alive — we need a `&` to it to answer
+    // connection-parameter requests (the macOS link-stall fix). Named `ble_stack` to avoid clashing
+    // with the embassy-net Wi-Fi `Stack`.
+    let ble_stack = trouble_host::new(controller, &mut resources).set_random_address(address);
     let Host {
         mut peripheral,
         mut runner,
         ..
-    } = host.build();
+    } = ble_stack.build();
 
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: DEVICE_NAME,
@@ -148,22 +111,24 @@ pub async fn run_setup(
     let _ = server.set(&server.improv.error_state, &ERR_NONE);
 
     info!("[improv] setup mode: advertising as {}", DEVICE_NAME);
-    let ip = match select(runner.run(), accept_loop(&mut peripheral, &server, &mut prov)).await {
+    match select(
+        runner.run(),
+        accept_loop(&mut peripheral, &server, control, stack, &ble_stack, store),
+    )
+    .await
+    {
         Either::First(_) => panic!("[improv] BLE runner stopped during setup"),
         Either::Second(ip) => ip,
-    };
-    // The successful attempt left the started Wi-Fi stack in the provisioner — hand it back so
-    // it (and the connection) stays alive after setup completes.
-    match prov.source.take() {
-        Some(NetSource::Ready { wifi, stack }) => (wifi, stack, ip),
-        _ => panic!("[improv] provisioned without a ready Wi-Fi stack"),
     }
 }
 
 async fn accept_loop(
-    peripheral: &mut Peripheral<'_, ExternalController<BleConnector<'static>, 1>, DefaultPacketPool>,
+    peripheral: &mut Peripheral<'_, BleController, DefaultPacketPool>,
     server: &Server<'_>,
-    prov: &mut Provisioner<'_>,
+    control: &mut Control<'static>,
+    stack: Stack<'static>,
+    ble_stack: &trouble_host::Stack<'_, BleController, DefaultPacketPool>,
+    store: &mut CredStore,
 ) -> Ipv4Addr {
     let mut adv_data = [0u8; 31];
     let adv_len = AdStructure::encode_slice(
@@ -207,17 +172,21 @@ async fn accept_loop(
             }
         };
         info!("[improv] client connected");
-        if let Some(ip) = serve_connection(server, &conn, prov).await {
+        if let Some(ip) = serve_connection(server, &conn, control, stack, ble_stack, store).await {
             return ip;
         }
         info!("[improv] client disconnected without provisioning; re-advertising");
+        display::set_screen(Screen::Setup); // clear any "joining"/"failed" screen from this attempt
     }
 }
 
 async fn serve_connection<P: PacketPool>(
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, P>,
-    prov: &mut Provisioner<'_>,
+    control: &mut Control<'static>,
+    stack: Stack<'static>,
+    ble_stack: &trouble_host::Stack<'_, BleController, P>,
+    store: &mut CredStore,
 ) -> Option<Ipv4Addr> {
     loop {
         match conn.next().await {
@@ -225,6 +194,20 @@ async fn serve_connection<P: PacketPool>(
                 info!("[improv] client disconnected: {:?}", reason);
                 return None;
             }
+            // macOS CoreBluetooth sends a connection-parameter update request right after
+            // connecting; it MUST be answered or the link stalls and the credential write never
+            // arrives (the macOS provisioning bug). Accept the peer's requested params.
+            GattConnectionEvent::RequestConnectionParams(req) => {
+                info!("[improv] connection-params request — accepting");
+                if let Err(e) = req.accept(None, ble_stack).await {
+                    warn!("[improv] failed to accept connection params: {:?}", e);
+                }
+            }
+            GattConnectionEvent::ConnectionParamsUpdated { conn_interval, .. } => {
+                info!("[improv] connection params updated (interval {:?})", conn_interval);
+            }
+            GattConnectionEvent::PhyUpdated { .. } => info!("[improv] phy updated"),
+            GattConnectionEvent::DataLengthUpdated { .. } => info!("[improv] data length updated"),
             GattConnectionEvent::Gatt { event } => {
                 // Acknowledge the GATT op; this also commits a (simple or long) write to the store.
                 if let Ok(reply) = event.accept() {
@@ -232,14 +215,17 @@ async fn serve_connection<P: PacketPool>(
                 }
                 // The "send Wi-Fi" RPC lands in rpc_command's backing store either way.
                 if let Ok(cmd) = server.get(&server.improv.rpc_command)
-                    && !cmd.is_empty() {
-                        info!("[improv] received {}-byte RPC", cmd.len());
-                        let _ = server.set(&server.improv.rpc_command, &Vec::<u8, 128>::new());
-                        if let Some(ip) = process_rpc(server, conn, &cmd, prov).await {
-                            return Some(ip);
-                        }
+                    && !cmd.is_empty()
+                {
+                    info!("[improv] received {}-byte RPC", cmd.len());
+                    let _ = server.set(&server.improv.rpc_command, &Vec::<u8, 128>::new());
+                    if let Some(ip) = process_rpc(server, conn, &cmd, control, stack, store).await {
+                        return Some(ip);
                     }
+                }
             }
+            // The remaining variants only exist with the `security` feature, which we don't enable.
+            #[allow(unreachable_patterns)]
             _ => {}
         }
     }
@@ -249,7 +235,9 @@ async fn process_rpc<P: PacketPool>(
     server: &Server<'_>,
     conn: &GattConnection<'_, '_, P>,
     data: &[u8],
-    prov: &mut Provisioner<'_>,
+    control: &mut Control<'static>,
+    stack: Stack<'static>,
+    store: &mut CredStore,
 ) -> Option<Ipv4Addr> {
     let Some((ssid, password)) = parse_send_wifi(data) else {
         warn!("[improv] malformed send-wifi RPC");
@@ -257,18 +245,29 @@ async fn process_rpc<P: PacketPool>(
         return None;
     };
 
-    info!("[improv] provisioning Wi-Fi: {}", ssid);
-    notify_state(server, conn, STATE_PROVISIONING).await;
-    let mut showing: String<32> = String::new();
-    let _ = showing.push_str(&ssid);
-    display::set_screen(Screen::Connecting(showing));
+    // A WPA2 passphrase is 8–63 chars (or empty for an open network). cyw43's `join` HANGS on an
+    // invalid-length passphrase rather than returning an error (its auth event never arrives), so
+    // reject it up front instead of feeding it to the driver.
+    if !password.is_empty() && !(8..=63).contains(&password.len()) {
+        warn!("[improv] invalid password length ({}); rejecting", password.len());
+        fail(server, conn, "bad password").await;
+        return None;
+    }
 
-    match prov.connect(&ssid, &password).await {
+    info!("[improv] provisioning Wi-Fi: {}", ssid);
+    display::set_screen(Screen::Connecting(ssid.clone()));
+    notify_state(server, conn, STATE_PROVISIONING).await;
+
+    // We join Wi-Fi here while the BLE GATT link is still connected, and the notify_*() calls below
+    // must reach the client over that same link.
+    match net::connect(control, stack, &ssid, &password).await {
         Ok(ip) => {
             info!("[improv] connected, ip = {}", ip);
+            // Persist so this network is rejoined on the next boot without re-provisioning.
             let creds = Credentials { ssid, password };
-            if let Err(e) = prov.store.save(&creds).await {
-                warn!("[improv] failed to persist credentials: {:?}", e);
+            match store.save(&creds).await {
+                Ok(()) => info!("[improv] credentials persisted"),
+                Err(e) => warn!("[improv] failed to persist credentials: {:?}", e),
             }
             let result = build_result(ip);
             let _ = server.set(&server.improv.rpc_result, &result);
@@ -277,11 +276,21 @@ async fn process_rpc<P: PacketPool>(
             Some(ip)
         }
         Err(()) => {
-            notify_error(server, conn, ERR_UNABLE_TO_CONNECT).await;
-            notify_state(server, conn, STATE_AUTHORIZED).await; // ready for another attempt
+            warn!("[improv] Wi-Fi connect failed");
+            fail(server, conn, "try again").await;
             None
         }
     }
+}
+
+/// Report a provisioning failure: Improv error + back to authorized, and a `FAILED` screen (clearing
+/// any stuck "joining" screen) so the panel never looks hung.
+async fn fail<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>, msg: &str) {
+    notify_error(server, conn, ERR_UNABLE_TO_CONNECT).await;
+    notify_state(server, conn, STATE_AUTHORIZED).await; // ready for another attempt
+    let mut s: String<24> = String::new();
+    let _ = s.push_str(msg);
+    display::set_screen(Screen::Failed(s));
 }
 
 async fn notify_state<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>, s: u8) {
@@ -297,24 +306,63 @@ async fn notify_error<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<
 }
 
 /// Parse Improv "send Wi-Fi credentials": `[0x01][datalen][ssidlen][ssid][pwlen][pw][checksum]`.
+///
+/// The `datalen` byte (index 1) is **reconstructed from the self-delimiting structure** rather than
+/// trusted, then the whole packet is checksum-validated. This tolerates a cyw43 BLE receive-path
+/// corruption that reproducibly decrements byte[1] by one (see docs/pico-port.md §"cyw43 BLE
+/// byte-1 corruption"), while the Improv checksum still guarantees the SSID/password are intact —
+/// any real cred corruption fails the checksum and is rejected, so the client just retries. We
+/// never accept creds the checksum doesn't cover.
 fn parse_send_wifi(d: &[u8]) -> Option<(String<32>, String<64>)> {
-    if d.len() < 4 || d[0] != CMD_SEND_WIFI {
+    if d.len() < 5 || d[0] != CMD_SEND_WIFI {
+        warn!(
+            "[improv] parse: bad header (len={}, cmd={:#04x})",
+            d.len(),
+            d.first().copied().unwrap_or(0)
+        );
         return None;
     }
-    let datalen = d[1] as usize;
-    if d.len() != datalen + 3 {
-        return None;
-    }
-    let checksum = d[d.len() - 1];
-    let sum = d[..d.len() - 1].iter().fold(0u8, |a, b| a.wrapping_add(*b));
-    if sum != checksum {
-        return None;
-    }
+    // Parse the self-delimiting structure (ssidlen/pwlen), ignoring the possibly-corrupt datalen.
     let ssid_len = d[2] as usize;
     let ssid = core::str::from_utf8(d.get(3..3 + ssid_len)?).ok()?;
     let pw_len = *d.get(3 + ssid_len)? as usize;
     let pw_start = 4 + ssid_len;
     let password = core::str::from_utf8(d.get(pw_start..pw_start + pw_len)?).ok()?;
+
+    // The packet must end exactly at the checksum: cmd+datalen+ssidlen+ssid+pwlen+pw+checksum.
+    let expected_total = 5 + ssid_len + pw_len;
+    if d.len() != expected_total {
+        warn!(
+            "[improv] parse: structure doesn't fit (len {}, structure implies {})",
+            d.len(),
+            expected_total
+        );
+        return None;
+    }
+
+    // Reconstruct datalen (= ssidlen byte + ssid + pwlen byte + pw) and validate the Improv
+    // checksum using it. The sender computed the checksum with the correct datalen, so a match
+    // proves the SSID/password are intact regardless of a corrupted byte[1].
+    let datalen = (ssid_len + pw_len + 2) as u8;
+    let mut sum = d[0].wrapping_add(datalen);
+    for &b in &d[2..d.len() - 1] {
+        sum = sum.wrapping_add(b);
+    }
+    let checksum = d[d.len() - 1];
+    if sum != checksum {
+        warn!(
+            "[improv] parse: checksum mismatch (calc {:#04x}, got {:#04x}) — rejecting, client should retry",
+            sum, checksum
+        );
+        return None;
+    }
+    if d[1] != datalen {
+        warn!(
+            "[improv] datalen byte arrived {:#04x}, reconstructed {:#04x} (known cyw43 BLE byte-1 \
+             corruption); creds verified intact by checksum",
+            d[1], datalen
+        );
+    }
     Some((String::try_from(ssid).ok()?, String::try_from(password).ok()?))
 }
 

@@ -2,43 +2,65 @@
 
 Monorepo for an internet-connected **64×64 HUB75 LED pixel display**:
 
-- **`firmware/`** — the device: an **ESP32-C6-DevKitM-1** driving a **Waveshare P3 64×64 HUB75**
-  panel, in **Rust (esp-hal 1.1 + Embassy, no_std)**. All Cargo/build/docs for the device live here.
-- **`web/`** — (planned) the cloud backend + web UI: **Svelte 5 / SvelteKit on Cloudflare**, tooled
-  with **Bun**. Not scaffolded yet.
+- **`firmware/`** — the device: a **Raspberry Pi Pico 2 W (RP2350)** driving a **Waveshare P3 64×64
+  HUB75** panel, in **Rust (embassy-rp, no_std)**. All Cargo/build/docs for the device live here.
+- **`web/`** — the cloud backend + web UI: **Svelte 5 / SvelteKit on Cloudflare** (Workers + D1 +
+  Drizzle), tooled with **Bun**. The app is scaffolded (default `sv` template); the bespoke piece so
+  far is `web/improv-test/`, a zero-build Web Bluetooth provisioning test client.
 
 Repo root holds only shared bits (this file, `.claude/`, `.gitignore`). **Run firmware commands from
 `firmware/`** (e.g. `cd firmware && cargo run`).
 
-## Current state (firmware)
+The firmware was **ported from an ESP32-C6** to the Pico 2 W. The full ESP32 tree is preserved at git
+tag **`esp32-final`**; the migration story and the verified dependency set live in
+**[firmware/docs/pico-port.md](firmware/docs/pico-port.md)**.
 
-- ✅ **Display** — esp-hub75 over PARL_IO + DMA, double-buffered, ~520 Hz, embedded-graphics.
-- ✅ **Wi-Fi onboarding** — first-run provisioning via **Improv over BLE**. Provision from Chrome
-  (Android / Windows / Linux — **not macOS**, see below), credentials persisted to flash, IP shown
-  on the panel. Hold **BOOT ~3 s** = factory reset (wipe creds, re-enter setup).
-- ⏳ **Open** — panel flicker on radio-active screens; macOS-Chrome provisioning; likely migration
-  to a **Raspberry Pi Pico 2 W** for a better wireless/PIO story.
+## Current state (firmware) — feature-complete on the Pico 2 W
+
+- ✅ **Display** — custom **HUB75 PIO+DMA driver** (`src/hub75.rs`): three PIO state machines on PIO1
+  fed by a self-chaining 4-channel DMA loop, double-buffered, binary-code-modulation color,
+  embedded-graphics. Refresh is hardware-timed → **no flicker** (the ESP build's radio-contention
+  flicker is gone).
+- ✅ **Wi-Fi onboarding** — first-run provisioning via **Improv over BLE** (cyw43 + trouble-host).
+  Provision from Chrome on **Android / Windows / Linux *and* macOS** (the ESP's macOS wall was a
+  browser-SDK bug, not the device — see below). Credentials **persist to flash**; the IP shows on the
+  panel; on reboot it rejoins automatically (else re-enters setup). Hold **BOOTSEL ~3 s** while
+  running = factory reset (wipe creds, reboot to setup). Bad creds fail fast (length-validated +
+  join timeout) with a `FAILED` screen — never a hang.
+- ⏳ **Open (polish, non-blocking)** — BCM color-depth tuning for smooth gradients (solid-color text
+  is fine); building out the `web/` app (scaffolded; UI/backend still TBD).
 
 ## Read before working
 
-- **[firmware/docs/gotchas.md](firmware/docs/gotchas.md)** — hard-won subtleties, dependency
-  landmines, the BLE debugging playbook, and the macOS/flicker conclusions. **Read before debugging.**
-- [firmware/docs/README.md](firmware/docs/README.md) — docs index. Also: hardware-wiring, firmware,
-  performance, wifi-onboarding.
+- **[firmware/docs/pico-port.md](firmware/docs/pico-port.md)** — the port: the verified dependency
+  set, the **dependency-compatibility constraints** (bt-hci / embassy-sync), the hard-won findings
+  (cyw43 BLE byte-1 corruption, the macOS fix), and milestones. **Read before touching deps or BLE.**
+- **[firmware/docs/gotchas.md](firmware/docs/gotchas.md)** — subtleties + landmines + the BLE
+  debugging playbook. **Read before debugging display or BLE.**
+- [firmware/docs/README.md](firmware/docs/README.md) — docs index (hardware-wiring, hub75-pico-wiring,
+  firmware, performance, wifi-onboarding).
 
 ## Constraints you should NOT relearn the hard way
 
-- **no_std / esp-hal world — never esp-idf.** Switching to esp-idf-hal would break the esp-hub75
-  display driver (PARL_IO is esp-hal-only).
-- **`embassy-sync` is pinned to 0.7** (trouble-host compat); esp-radio is the renamed `esp-wifi`.
-- **`esp_hal::Async` is `!Send`** → thread-mode executor only (no interrupt-executor for the
-  drivers).
-- **macOS Chrome BLE provisioning does not work** (esp-radio ↔ CoreBluetooth link-layer issue,
-  not our code) — provision from Android. iOS never works (no Web Bluetooth).
-- Pin map quirks: HUB75 `D` is the silk-"GND" pin 12; `B` is on GPIO14 (GPIO8 is the onboard LED);
-  GPIO10/11 aren't broken out. See firmware/docs/hardware-wiring.md.
+- **no_std / embassy-rp world.** Target **`thumbv8m.main-none-eabihf`** (ARM Cortex-M33); the RP2350's
+  RISC-V (Hazard3) cores are **not** supported by embassy-rp.
+- **Dependency compatibility is delicate.** `cyw43` and `trouble-host` must agree on the **bt-hci**
+  major. We pair **cyw43 0.7 + trouble-host 0.6** (both bt-hci 0.8), which forces an **embassy-sync
+  0.7/0.8 split** (a direct `embassy-sync = "0.7"` for trouble's `#[gatt_server]` macros). Do **not**
+  bump trouble to 0.7 — it needs bt-hci 0.9, which cyw43 0.7 can't provide. See pico-port.md before
+  upgrading anything in this cluster.
+- **Radio owns PIO0 + DMA_CH0/CH1; HUB75 uses PIO1 + DMA_CH2–CH5.** The **onboard LED is on the cyw43
+  chip** (`control.gpio_set(0, …)`), not a GPIO.
+- **macOS Chrome provisioning works** — but only with an Improv client that uses **write-with-response**
+  (improv-wifi/sdk-ble-js#213, fixed Dec 2025). `web/improv-test/` uses the correct path; a stale
+  `improv-wifi.com` PWA cache can still fail. iOS never works (no Web Bluetooth).
+- **Pin map:** HUB75 **`D` is the silk-"GND" pad 12** — wire to **GP12**, not ground. Full map +
+  ESP32 migration table in [firmware/docs/hub75-pico-wiring.md](firmware/docs/hub75-pico-wiring.md).
 
 ## Build / run
 
-From **`firmware/`**: `cargo run` flashes + monitors (espflash, `riscv32imac-unknown-none-elf`);
-`cargo build` / `cargo clippy` to check (both currently clean).
+From **`firmware/`**: `cargo run` builds + flashes the firmware over USB via **`picotool`** (hold
+**BOOTSEL** while plugging in; `picotool` is a Homebrew install — no debug probe needed). Logs come
+back over **USB-serial** (`screen /dev/tty.usbmodem*` — the lower-numbered data interface).
+Diagnostics: `cargo run --bin firstlight` (bit-bang wiring test), `cargo run --bin hub75test` (PIO
+driver test pattern). `cargo build` / `cargo clippy` to check (both currently clean).

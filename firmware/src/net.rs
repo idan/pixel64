@@ -1,66 +1,58 @@
-//! Wi-Fi station bring-up: esp-radio Wi-Fi + embassy-net (DHCP).
+//! Wi-Fi station connect: join + DHCP over the cyw43 `Control` and the embassy-net `Stack`.
 //!
-//! [`start`] creates the controller + IP stack (not yet connected); [`connect`] applies
-//! credentials at runtime, joins, and waits for a DHCP lease. Used by both the boot path
-//! (stored creds) and the Improv provisioning path (creds from the phone).
+//! Used by both the boot path (stored credentials) and the Improv provisioning path (creds from the
+//! browser). On the cyw43 the radio and IP stack are already up — this just applies credentials and
+//! waits for a lease.
 
-use embassy_executor::Spawner;
-use embassy_net::{Runner, Stack, StackResources};
-use esp_hal::rng::Rng;
-use esp_radio::wifi::{
-    sta::StationConfig, Config as WifiConfig, ControllerConfig, Interface, PowerSaveMode,
-    WifiController, WifiError,
-};
-use static_cell::StaticCell;
+use core::net::Ipv4Addr;
 
-#[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, Interface>) {
-    runner.run().await
-}
+use cyw43::{Control, JoinOptions};
+use embassy_futures::select::{select, Either};
+use embassy_net::Stack;
+use embassy_time::{Duration, Timer};
+use log::warn;
 
-/// Bring up the Wi-Fi station and IP stack. The returned controller is *not* connected yet.
-pub fn start(
-    wifi: esp_hal::peripherals::WIFI<'static>,
-    spawner: Spawner,
-) -> Result<(WifiController<'static>, Stack<'static>), WifiError> {
-    let iface = Interface::station();
-    let mut controller = WifiController::new(wifi, ControllerConfig::default())?;
-    // Disable Wi-Fi power save: the radio's periodic sleep/wake (every beacon/DTIM interval)
-    // steals CPU from the continuously-refreshed HUB75 panel and shows up as flicker. We're
-    // mains-powered, so the extra current draw doesn't matter.
-    let _ = controller.set_power_saving(PowerSaveMode::None);
+/// How long to wait for association before giving up. cyw43's `join` doesn't reliably time out on a
+/// bad password (it can block ~indefinitely), so we bound it ourselves.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long to wait for a DHCP lease after associating before giving up.
+const DHCP_TIMEOUT: Duration = Duration::from_secs(15);
 
-    let rng = Rng::new();
-    let seed = ((rng.random() as u64) << 32) | rng.random() as u64;
-
-    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
-    let resources = RESOURCES.init(StackResources::new());
-
-    let (stack, runner) = embassy_net::new(
-        iface,
-        embassy_net::Config::dhcpv4(Default::default()),
-        resources,
-        seed,
-    );
-    spawner.spawn(net_task(runner).unwrap());
-
-    Ok((controller, stack))
-}
-
-/// Apply credentials, connect, and wait for a DHCP lease; returns the assigned IPv4 address.
+/// Join `ssid` and wait for a DHCP lease; returns the assigned IPv4 address. Bounded by timeouts so
+/// bad credentials surface as `Err(())` rather than hanging.
 pub async fn connect(
-    controller: &mut WifiController<'static>,
-    stack: &Stack<'static>,
+    control: &mut Control<'static>,
+    stack: Stack<'static>,
     ssid: &str,
     password: &str,
-) -> Result<core::net::Ipv4Addr, WifiError> {
-    controller.set_config(&WifiConfig::Station(
-        StationConfig::default()
-            .with_ssid(ssid)
-            .with_password(password.into()),
-    ))?;
-    controller.connect_async().await?;
-    stack.wait_config_up().await;
-    let cfg = stack.config_v4().expect("ipv4 config present after wait_config_up");
-    Ok(cfg.address.address())
+) -> Result<Ipv4Addr, ()> {
+    // Start from a clean state. cyw43's `join` has no internal timeout, so a previous attempt that
+    // we abandoned on `JOIN_TIMEOUT` (or that the firmware left mid-association) can make the next
+    // join hang — `leave()` (disassociate) resets it. Harmless if not currently associated.
+    control.leave().await;
+
+    match select(
+        control.join(ssid, JoinOptions::new(password.as_bytes())),
+        Timer::after(JOIN_TIMEOUT),
+    )
+    .await
+    {
+        Either::First(Ok(())) => {}
+        Either::First(Err(e)) => {
+            warn!("[net] join failed: {:?}", e);
+            return Err(());
+        }
+        Either::Second(()) => {
+            warn!("[net] join timed out after {}s", JOIN_TIMEOUT.as_secs());
+            return Err(());
+        }
+    }
+    match select(stack.wait_config_up(), Timer::after(DHCP_TIMEOUT)).await {
+        Either::First(()) => {}
+        Either::Second(()) => {
+            warn!("[net] DHCP timed out after associating");
+            return Err(());
+        }
+    }
+    stack.config_v4().map(|c| c.address.address()).ok_or(())
 }

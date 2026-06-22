@@ -1,98 +1,92 @@
 # Firmware
 
+Rust, `no_std`, on **embassy-rp** for the RP2350 (Pico 2 W). Target
+`thumbv8m.main-none-eabihf` (ARM Cortex-M33). For the full crate-version set and the
+dependency-compatibility constraints, see **[pico-port.md](pico-port.md)** — that's the source of
+truth; the table below is an orientation.
+
 ## Crate stack
 
 | Crate | Version | Role |
 |-------|---------|------|
-| `esp-hal` | `~1.1` | HAL for the ESP32-C6 (`esp32c6`, `unstable`) |
-| `esp-rtos` | `0.3` | Embassy executor + time driver |
-| `esp-hub75` | `0.11` | HUB75 driver — DMA out via PARL_IO, `embedded-graphics` target |
-| `embedded-graphics` | `0.8` | Drawing primitives, fonts, text |
-| `embassy-sync` | `0.8` | `Signal` for the framebuffer hand-off |
-| `heapless` | `0.9` | `String` for on-panel text formatting |
+| `embassy-rp` | `0.10` | HAL for the RP2350 (`rp235xa`, `time-driver`, `binary-info`) + executor |
+| `cyw43` / `cyw43-pio` | `0.7` / `0.10` | CYW43439 Wi-Fi **and** BLE, over PIO-emulated SPI |
+| `trouble-host` | `0.6` | BLE GATT host for the Improv service (pinned to 0.6 — bt-hci 0.8 to match cyw43) |
+| `embassy-net` | `0.9` | DHCP / IP stack over the cyw43 net device |
+| `sequential-storage` + `embassy-embedded-hal` | `7` / `0.6` | credentials in flash (CRC + power-fail safe) |
+| `pio` / `pio-proc` | `0.3` | assemble the HUB75 PIO programs (`pio_asm!`) |
+| `embedded-graphics` | `0.8` | drawing primitives, fonts, text → the HUB75 `DrawTarget` |
+| `embassy-usb` / `embassy-usb-logger` | `0.6` | `log` over USB-CDC serial (the no-probe dev loop) |
+| `embassy-sync` | `0.7` **+** `0.8` | split: `0.7` for trouble's gatt macros, `0.8` for the rest (see pico-port.md) |
+| `heapless` | `0.9` | `String`/`Vec` for RPC payloads + on-panel text |
 
-`esp-hub75` 0.11 targets esp-hal 1.1.0 exactly, so it drops onto the generated
-boilerplate without version juggling.
+There is **no heap** — the whole stack is static (no `esp-alloc`/`embedded-alloc`).
 
-### Why PARL_IO
+## The HUB75 display: PIO + DMA, zero CPU
 
-The ESP32-C6 has a **Parallel IO (PARL_IO)** peripheral that streams parallel data
-out with DMA. `esp-hub75` uses it to clock HUB75 pixel data with minimal CPU
-involvement — the alternative (bit-banging GPIO) is far too slow for a flicker-free
-64×64 panel. (On the ESP32/-S3, the same crate uses I2S or LCD_CAM instead.)
+The panel holds no image, so pixels must be clocked out *continuously*. On the RP2350 this is done
+entirely in hardware by the **PIO** (Programmable I/O) blocks + **DMA** — the CPU never touches the
+refresh, which is why there's **no flicker** even while the radio is busy (the exact failure mode of
+the ESP build, where a single core had to interleave refresh with the radio).
 
-## Render architecture (double-buffered)
+`src/hub75.rs` (ported from [kjagiello/hub75-pio](https://github.com/kjagiello/hub75-pio-rs)) runs
+**three PIO state machines on PIO1**, handshaking over PIO IRQs:
 
-The panel holds no image, so something must clock pixels out *continuously*. We split
-that from the drawing work using two framebuffers that ping-pong between two tasks
-(see `src/bin/main.rs`):
+- **Data SM** — shifts the 6 RGB bits per pixel out to GP0–GP5, toggling CLK (side-set). One
+  bit-plane of one row per pass.
+- **Row SM** — drives the A–E address lines + LAT (side-set), advancing row and bit-plane.
+- **OE SM** — times the **binary-code-modulation (BCM)** display window per bit-plane via OE.
 
-```
-            ┌───────────────┐   TO_REFRESH (Signal)    ┌────────────────┐
-            │   draw_task    │ ───────────────────────► │  refresh_task   │
-   draws →  │  (animation,   │                          │  (DMA stream to │ → panel
-            │   ~60 fps)     │ ◄─────────────────────── │   the panel)    │
-            └───────────────┘    TO_DRAW (Signal)       └────────────────┘
-```
+A **self-chaining 4-channel DMA loop** (DMA_CH2–CH5, programmed via `embassy_rp::pac` since the safe
+DMA API doesn't expose channel chaining) feeds the framebuffer to the data SM and the BCM dwell
+weights to the OE SM, **forever**, reloading from a pointer so flipping that pointer swaps buffers.
 
-- **`refresh_task`** loops forever: `hub75.render(&fb)` → `wait_for_done().await`
-  → `wait()` (hands the driver back). Counts completed transfers/sec → `REFRESH_HZ`.
-  This is what keeps the panel lit and flicker-free.
-- **`draw_task`** clears the back buffer, draws the frame (bouncing ball + live
-  counters), publishes it via the `TO_REFRESH` signal, and reclaims the other buffer
-  from `TO_DRAW`. Throttled to ~60 fps. Counts frames/sec → `DRAW_HZ`.
-- The two `embassy_sync::Signal`s carry `&'static mut FrameBuffer` ownership back and
-  forth, so a buffer is never half-drawn while it's being clocked out.
+### Color: binary-code modulation
 
-### Framebuffer type
+Color depth is `B` bit-planes (currently **8**). Each plane `i` is displayed for `2^i − 1` ticks, so
+the planes sum to a weighted intensity. `set_pixel` packs a pixel's per-plane bits into the
+framebuffer (`XXBGRBGR` per byte, top half in bits 0–2, bottom half in 3–5). `PLANES` (`B`) and the
+clock dividers trade color depth against refresh — see [performance.md](performance.md).
 
-```rust
-const ROWS:   usize = 64;
-const COLS:   usize = 64;
-const NROWS:  usize = compute_rows(ROWS); // 32 (1/32 scan)
-const PLANES: usize = 4;                  // BCM color-depth planes
-type FrameBuffer = DmaFrameBuffer<NROWS, COLS, PLANES>;
-```
+### Double-buffering + drawing
 
-`DmaFrameBuffer` (the `framebuffer::bitplane::plain` variant) implements
-`embedded_graphics::DrawTarget`, so anything from the embedded-graphics ecosystem
-(shapes, fonts, BMPs) draws straight into it. `PLANES` trades color depth against
-refresh rate — see [performance.md](performance.md).
+`Display` implements `embedded_graphics::DrawTarget<Color = Rgb888>`, so any embedded-graphics
+content draws straight in. Drawing goes into the **inactive** buffer; `commit()` flips it live and
+zeroes the next inactive buffer. `src/display.rs` runs one **draw task** that renders the current
+`Screen` and commits at ~30 fps — there's no refresh task (the DMA does that in hardware).
 
-### Single executor (not the interrupt executor)
+> Orientation: the driver carries hub75-pio's un-mirror convention, so the image lands 180° from the
+> draw origin. The panel is square/free-orientation — just mount it to suit.
 
-The `esp-hub75` example runs `refresh_task` on a high-priority **interrupt executor**.
-We don't, because under esp-rtos 0.3 that executor's `SendSpawner` requires `Send`,
-and the driver is built on `esp_hal::Async`, which is **`!Send`** (it holds a
-`PhantomData<*const ()>`). Both tasks therefore run cooperatively on the thread-mode
-executor.
+## Wi-Fi onboarding + persistence
 
-This is fine for the current workload — `refresh_task` yields during every DMA
-transfer, leaving ample time for the light, throttled `draw_task`. If heavier drawing
-ever starts to dent the refresh rate, the fix is to keep the `!Send` driver on the
-thread-mode executor while moving *other* work to an interrupt executor — not to move
-the driver.
+See **[wifi-onboarding.md](wifi-onboarding.md)**. In brief: `src/improv.rs` runs the Improv GATT
+service over `trouble-host` on cyw43's BLE controller; `src/net.rs` joins Wi-Fi (`control.join` +
+DHCP); `src/storage.rs` persists credentials to a reserved region at the top of flash. `main.rs` is
+the boot state machine: stored creds → reconnect, else Improv setup.
 
-## Build & flash
+## Build & flash (no debug probe)
 
-The repo is preconfigured (`.cargo/config.toml` sets the RISC-V target, `build-std`,
-and an `espflash` runner):
+The repo is preconfigured (`.cargo/config.toml` sets the target + a `picotool` runner; `memory.x`
+and `build.rs` set up the RP2350 boot image):
 
 ```sh
-cargo run        # builds, flashes over USB, and opens the serial monitor
-cargo build      # build only
+cargo run                      # build + flash the firmware over USB, then run
+cargo run --bin firstlight     # diagnostic: bit-bang HUB75 wiring test
+cargo run --bin hub75test      # diagnostic: PIO driver full-color test pattern
+cargo build / cargo clippy     # check (both clean)
 ```
 
-Serial output (via `esp-println`, `ESP_LOG=info`) logs the refresh and draw rates
-once per second. The same two numbers render on the panel as `R#### D##`.
+Hold **BOOTSEL** while plugging in so the board enters its ROM bootloader, then `cargo run` flashes
+via `picotool` (Homebrew install; **not** `elf2uf2-rs` — that emits the RP2040 UF2 family id, which
+the RP2350 rejects). Logs come back over **USB-serial** on the same cable (`embassy-usb-logger`):
+`screen /dev/tty.usbmodem*` (the lower-numbered data interface). No probe needed; a debug probe is an
+optional upgrade (swap the runner to `probe-rs run --chip RP235x`).
 
 ## First-light test pattern
 
-Before the animation, a static test pattern is the quickest wiring check:
-
-- **1px white border** → confirms the full 64×64 extent and every edge.
-- **R / G / B bars** → confirms color channels aren't swapped.
-- **Centered text** → confirms orientation and that the two 32-row halves align.
-
-A **vertical split / duplicated image** points to an address-line (A–E) wiring error —
-most often the pin-12 "GND"/D issue described in [hardware-wiring.md](hardware-wiring.md).
+`cargo run --bin firstlight` scans a static pattern via plain GPIO (no PIO) to check wiring before
+trusting the driver: solid R/G/B (channels + level shifter), a top/bottom split + row bands (address
+lines, incl. the pin-12/D trap), and corner markers (orientation). A **vertical split / duplicated
+image** points to an address-line error — most often the silk-"GND"/D pad (see
+[hardware-wiring.md](hardware-wiring.md)).

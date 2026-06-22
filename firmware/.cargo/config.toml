@@ -1,17 +1,16 @@
-[target.riscv32imac-unknown-none-elf]
-runner = "espflash flash --monitor --chip esp32c6"
-
-[env]
-ESP_LOG="info"
+# No-probe dev loop: flash over the Pico's own USB via the BOOTSEL ROM bootloader, then read logs
+# back over USB-serial (embassy-usb-logger) on the same cable. See docs/pico-port.md.
+#
+# Flashing uses `picotool` (Homebrew: `brew install picotool`), NOT `elf2uf2-rs` — the latter only
+# emits the RP2040 UF2 family id (0xe48bff56), which the RP2350 bootrom rejects. picotool tags the
+# image as rp2350-arm-s (0xe48bff59) correctly.
+#
+# `cargo run` loads the ELF straight to a board in BOOTSEL mode over USB and executes it:
+#   1. hold BOOTSEL while plugging in the Pico 2 W (mounts as the RP2350 bootloader)
+#   2. `cargo run`
+# To switch to a debug probe later, swap the runner for: probe-rs run --chip RP235x
+[target.thumbv8m.main-none-eabihf]
+runner = "picotool load -u -v -x -t elf"
 
 [build]
-rustflags = [
-  # Required to obtain backtraces (e.g. when using the "esp-backtrace" crate.)
-  # NOTE: May negatively impact performance of produced code
-  "-C", "force-frame-pointers",
-]
-
-target = "riscv32imac-unknown-none-elf"
-
-[unstable]
-build-std = ["core"]
+target = "thumbv8m.main-none-eabihf"

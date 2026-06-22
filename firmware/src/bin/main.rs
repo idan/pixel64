@@ -1,157 +1,221 @@
+//! pixel64 — RP2350 / Pico 2 W.
+//!
+//! Boot: bring up cyw43 (Wi-Fi + BT) and the embassy-net stack, then either rejoin a stored Wi-Fi
+//! network directly, or — with no stored credentials — run Improv-over-BLE setup: advertise the
+//! Improv GATT as `pixel64`, take credentials from a browser, join Wi-Fi while the BLE link is up,
+//! persist them to flash, and report the IP back over BLE. Stored credentials that fail to connect
+//! fall back to setup. Provision from Chrome or the `web/improv-test/` client (Android + macOS).
+//! See docs/pico-port.md.
+
 #![no_std]
 #![no_main]
-#![deny(
-    clippy::mem_forget,
-    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
-    holding buffers for the duration of a data transfer."
-)]
 
-use core::net::Ipv4Addr;
-
+use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use embassy_executor::Spawner;
-use embassy_net::Stack;
-use embassy_time::{Duration, Timer};
-use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pin, Pull};
-use esp_hal::system::software_reset;
-use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::time::Rate;
-use esp_hal::timer::timg::TimerGroup;
-use esp_hub75::{Hub75, Hub75Pins16};
-use esp_radio::ble::controller::BleConnector;
-use esp_radio::wifi::WifiController;
+use embassy_net::{Config as NetConfig, Runner as NetRunner, StackResources};
+use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::RoscRng;
+use embassy_rp::dma::{Channel, InterruptHandler as DmaInterruptHandler};
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::{DMA_CH0, PIO0, PIO1, USB};
+use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
+use embassy_time::Timer;
 use heapless::String;
-use log::{error, info, warn};
-use trouble_host::prelude::ExternalController;
+use log::{info, warn};
+use static_cell::StaticCell;
 
-use pixel64::display::{self, FrameBuffer, Screen};
+use pixel64::bootsel;
+use pixel64::display::{self, Screen};
+use pixel64::hub75::{Display, DisplayMemory, Hub75Dma, Hub75Pins};
+use pixel64::improv;
+use pixel64::net;
 use pixel64::storage::CredStore;
-use pixel64::{improv, net};
+
+// Program metadata for `picotool info`. The embassy-rp `binary-info` feature emits the RP2350 boot
+// image-def block (.start_block) on its own, so no manual `ImageDef` is needed.
+#[unsafe(link_section = ".bi_entries")]
+#[used]
+pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 3] = [
+    embassy_rp::binary_info::rp_program_name!(c"pixel64"),
+    embassy_rp::binary_info::rp_cargo_version!(),
+    embassy_rp::binary_info::rp_program_build_attribute!(),
+];
+
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => UsbInterruptHandler<USB>;
+    PIO0_IRQ_0 => PioInterruptHandler<PIO0>; // cyw43
+    PIO1_IRQ_0 => PioInterruptHandler<PIO1>; // HUB75
+    DMA_IRQ_0 => DmaInterruptHandler<DMA_CH0>;
+});
 
 #[panic_handler]
-fn panic(panic_info: &core::panic::PanicInfo) -> ! {
-    error!("{}", panic_info);
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // No probe → no defmt/RTT; just halt. (A panic before USB enumerates is invisible over
+    // USB-serial — a known no-probe limitation, see docs/pico-port.md.)
     loop {}
 }
 
-esp_bootloader_esp_idf::esp_app_desc!();
+/// Runs the USB device + CDC-ACM serial class and pumps `log` records out over it.
+#[embassy_executor::task]
+async fn logger_task(driver: Driver<'static, USB>) {
+    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
+}
 
-#[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
-    esp_println::logger::init_logger_from_env();
+/// Drives the cyw43 chip's low-level SPI event loop (Wi-Fi + BLE traffic). Runs forever.
+#[embassy_executor::task]
+async fn cyw43_task(
+    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>,
+) -> ! {
+    runner.run().await
+}
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
+/// Drives the embassy-net IP stack (DHCP, etc.). Runs forever.
+#[embassy_executor::task]
+async fn net_task(mut runner: NetRunner<'static, cyw43::NetDriver<'static>>) -> ! {
+    runner.run().await
+}
 
-    // Wi-Fi + BLE coexistence (provisioning connects while advertising) wants a generous heap.
-    esp_alloc::heap_allocator!(size: 128 * 1024);
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
 
-    // GPIO8 drives the onboard WS2812 RGB LED, which we don't use — hold it low so it stays dark.
-    let _onboard_led_off = Output::new(peripherals.GPIO8, Level::Low, OutputConfig::default());
+    // USB-serial logging on the same cable that flashes the board.
+    let driver = Driver::new(p.USB, Irqs);
+    spawner.spawn(logger_task(driver).unwrap());
 
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
-    info!("Embassy initialized!");
-
-    // --- Display ---
-    // KEEP IN SYNC: docs/hardware-wiring.md holds the full pin map (the "GND"-silked pin 12 is D,
-    // and B is on GPIO14 because GPIO8 is the onboard LED).
-    let pins = Hub75Pins16 {
-        red1: peripherals.GPIO19.degrade(),
-        grn1: peripherals.GPIO20.degrade(),
-        blu1: peripherals.GPIO21.degrade(),
-        red2: peripherals.GPIO22.degrade(),
-        grn2: peripherals.GPIO23.degrade(),
-        blu2: peripherals.GPIO15.degrade(),
-        addr0: peripherals.GPIO2.degrade(),  // A
-        addr1: peripherals.GPIO14.degrade(), // B  (off GPIO8 — that's the onboard RGB LED)
-        addr2: peripherals.GPIO1.degrade(),  // C
-        addr3: peripherals.GPIO0.degrade(),  // D  (pin 12, silk says "GND")
-        addr4: peripherals.GPIO3.degrade(),  // E
-        blank: peripherals.GPIO5.degrade(),  // OE
-        clock: peripherals.GPIO7.degrade(),  // CLK
-        latch: peripherals.GPIO6.degrade(),  // LAT
-    };
-    let tx_descriptors = esp_hub75::hub75_dma_descriptors!(FrameBuffer);
-    let hub75 = Hub75::new_async(
-        peripherals.PARL_IO,
-        pins,
-        peripherals.DMA_CH0,
-        tx_descriptors,
-        Rate::from_mhz(20),
-    )
-    .expect("failed to create Hub75 driver");
-    display::start(hub75, spawner);
+    // HUB75 panel (PIO1 + DMA_CH2–5) — bring it up first so "Booting" shows while the radio comes
+    // up. Pin map per docs/hub75-pico-wiring.md.
+    let pio1 = Pio::new(p.PIO1, Irqs);
+    static DMEM: StaticCell<DisplayMemory> = StaticCell::new();
+    let panel = Display::new(
+        DMEM.init(DisplayMemory::new()),
+        pio1.common,
+        pio1.sm0,
+        pio1.sm1,
+        pio1.sm2,
+        Hub75Pins {
+            r1: p.PIN_0,
+            g1: p.PIN_1,
+            b1: p.PIN_2,
+            r2: p.PIN_3,
+            g2: p.PIN_4,
+            b2: p.PIN_5,
+            clk: p.PIN_6,
+            lat: p.PIN_7,
+            oe: p.PIN_8,
+            a: p.PIN_9,
+            b: p.PIN_10,
+            c: p.PIN_11,
+            d: p.PIN_12,
+            e: p.PIN_13,
+        },
+        Hub75Dma {
+            fb: p.DMA_CH2,
+            fb_loop: p.DMA_CH3,
+            oe: p.DMA_CH4,
+            oe_loop: p.DMA_CH5,
+        },
+    );
+    display::start(panel, spawner);
     display::set_screen(Screen::Booting);
 
-    // --- Persistent storage ---
-    let mut store = CredStore::new(peripherals.FLASH).expect("storage init failed");
+    info!("pixel64: bringing up cyw43 radio (Wi-Fi + BT)…");
 
-    // --- Boot state machine: stored creds -> connect; otherwise Improv setup ---
-    // Wi-Fi is NOT started up front: during BLE setup the radio stays uncontended (no coex
-    // starving the GATT stack or strobing the display). It's brought up lazily on the first
-    // credential attempt — see improv::NetSource.
-    // If stored creds connect directly, this holds the live (controller, stack, ip).
-    let mut online_net: Option<(WifiController<'static>, Stack<'static>, Ipv4Addr)> = None;
-    let net_source;
-    if let Some(creds) = store.load().await {
-        info!("found stored credentials for '{}', connecting", creds.ssid);
-        let mut showing: String<32> = String::new();
-        let _ = showing.push_str(&creds.ssid);
-        display::set_screen(Screen::Connecting(showing));
-        let (mut wifi, stack) = net::start(peripherals.WIFI, spawner).expect("wifi start failed");
-        match net::connect(&mut wifi, &stack, &creds.ssid, &creds.password).await {
-            Ok(ip) => {
-                online_net = Some((wifi, stack, ip));
-                net_source = None;
-            }
-            Err(e) => {
-                warn!("stored credentials failed to connect: {:?}", e);
-                net_source = Some(improv::NetSource::Ready { wifi, stack });
+    // cyw43 firmware blobs (vendored). `fw`/`btfw`/`nvram` need 4-byte alignment (aligned_bytes!);
+    // `clm` is passed to control.init() as a plain slice. `btfw` is the Bluetooth firmware.
+    let fw = cyw43::aligned_bytes!("../../cyw43-firmware/43439A0.bin");
+    let btfw = cyw43::aligned_bytes!("../../cyw43-firmware/43439A0_btfw.bin");
+    let nvram = cyw43::aligned_bytes!("../../cyw43-firmware/nvram_rp2040.bin");
+    let clm: &[u8] = include_bytes!("../../cyw43-firmware/43439A0_clm.bin");
+
+    // CYW43439 on GP23 (power) + PIO-emulated SPI on GP24/25/29 (see docs/pico-pinout.md).
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let Pio {
+        mut common,
+        sm0,
+        irq0,
+        ..
+    } = Pio::new(p.PIO0, Irqs);
+    let spi = PioSpi::new(
+        &mut common,
+        sm0,
+        RM2_CLOCK_DIVIDER,
+        irq0,
+        cs,
+        p.PIN_24, // DIO
+        p.PIN_29, // CLK
+        Channel::new(p.DMA_CH0, Irqs),
+    );
+
+    static STATE: StaticCell<cyw43::State> = StaticCell::new();
+    let state = STATE.init(cyw43::State::new());
+    // new_with_bluetooth: same runner drives Wi-Fi + BT. control = Wi-Fi/LED; bt_device = BLE.
+    let (net_device, bt_device, mut control, runner) =
+        cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw, nvram).await;
+    spawner.spawn(cyw43_task(runner).unwrap());
+    control.init(clm).await;
+    info!("pixel64: cyw43 up");
+
+    // IP stack (DHCP) over the cyw43 network device — ready for the join during provisioning.
+    let seed = RoscRng.next_u64();
+    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+    let (stack, net_runner) = embassy_net::new(
+        net_device,
+        NetConfig::dhcpv4(Default::default()),
+        RESOURCES.init(StackResources::new()),
+        seed,
+    );
+    spawner.spawn(net_task(net_runner).unwrap());
+
+    // Persistent credential store (top of flash).
+    let mut store = CredStore::new(p.FLASH);
+
+    // Boot state machine: stored creds → rejoin directly; otherwise Improv setup over BLE.
+    let ip = match store.load().await {
+        Some(creds) => {
+            info!("pixel64: stored credentials for '{}' — connecting", creds.ssid);
+            let mut showing: String<32> = String::new();
+            let _ = showing.push_str(&creds.ssid);
+            display::set_screen(Screen::Connecting(showing));
+            match net::connect(&mut control, stack, &creds.ssid, &creds.password).await {
+                Ok(ip) => ip,
+                Err(()) => {
+                    warn!("pixel64: stored credentials failed — entering Improv setup");
+                    display::set_screen(Screen::Setup);
+                    improv::run_setup(bt_device, &mut control, stack, &mut store).await
+                }
             }
         }
-    } else {
-        net_source = Some(improv::NetSource::Lazy {
-            wifi: peripherals.WIFI,
-            spawner,
-        });
-    }
-
-    // Keep the Wi-Fi controller + stack bound for the whole program (main never returns) so the
-    // connection persists after onboarding. `_wifi`/`_stack` are intentionally held, not dropped.
-    let (_wifi, _stack, ip) = match online_net {
-        Some(online) => online,
         None => {
-            info!("no working credentials — entering Improv setup mode");
+            info!("pixel64: no stored credentials — entering Improv setup (provision via Chrome)");
             display::set_screen(Screen::Setup);
-            let connector = BleConnector::new(peripherals.BT, Default::default()).unwrap();
-            let ble: ExternalController<_, 1> = ExternalController::new(connector);
-            improv::run_setup(ble, net_source.unwrap(), &mut store).await
+            improv::run_setup(bt_device, &mut control, stack, &mut store).await
         }
     };
 
-    info!("online at {}", ip);
+    info!("pixel64: ONLINE — ip = {}", ip);
     display::set_screen(Screen::Online(ip));
+    control.gpio_set(0, true).await; // solid onboard LED = online
 
-    // Factory reset: hold BOOT (GPIO9) for ~3 s to wipe stored credentials and restart into
-    // setup mode. (BOOT is a strapping pin, so we poll it at runtime — holding it across the
-    // power-on reset would instead enter download mode. We also wait for release before
-    // resetting so the restart itself doesn't strap into download mode.)
-    let boot = Input::new(peripherals.GPIO9, InputConfig::default().with_pull(Pull::Up));
+    // Factory reset: hold BOOTSEL ~3 s to wipe credentials and reboot into setup. The runtime
+    // BOOTSEL read briefly floats the flash CS (IRQs off, RAM code — see src/bootsel.rs); fine
+    // alongside the PIO/DMA refresh, and it doesn't overlap a flash write here.
+    let mut bootsel_pin = p.BOOTSEL;
     let mut held_ms = 0u32;
     loop {
-        Timer::after(Duration::from_millis(100)).await;
-        if boot.is_low() {
+        Timer::after_millis(100).await;
+        if bootsel::is_bootsel_pressed(bootsel_pin.reborrow()) {
             held_ms += 100;
             if held_ms >= 3000 {
-                warn!("BOOT held — wiping Wi-Fi credentials; release BOOT to restart");
+                warn!("pixel64: BOOTSEL held — wiping Wi-Fi credentials; release to reboot");
                 let _ = store.clear().await;
-                while boot.is_low() {
-                    Timer::after(Duration::from_millis(50)).await;
+                while bootsel::is_bootsel_pressed(bootsel_pin.reborrow()) {
+                    Timer::after_millis(50).await;
                 }
-                Timer::after(Duration::from_millis(100)).await; // let the log flush
-                software_reset();
+                Timer::after_millis(200).await; // let the log flush over USB
+                cortex_m::peripheral::SCB::sys_reset();
             }
         } else {
             held_ms = 0;
