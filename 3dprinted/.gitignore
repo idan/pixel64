@@ -1,0 +1,2 @@
+# STLs are generated from the .scad sources — run ./render.sh to (re)build them.
+*.stl
