@@ -31,6 +31,9 @@ use trouble_host::prelude::*;
 
 pub const DEVICE_NAME: &str = "pixel64";
 
+/// The BLE controller type: cyw43's BT transport behind bt-hci's ExternalController.
+type BleController = ExternalController<BtDriver<'static>, 1>;
+
 // Improv current-state values.
 const STATE_AUTHORIZED: u8 = 0x02;
 const STATE_PROVISIONING: u8 = 0x03;
@@ -81,16 +84,19 @@ pub async fn run_setup(
     control: &mut Control<'static>,
     stack: Stack<'static>,
 ) -> Ipv4Addr {
-    let controller: ExternalController<_, 1> = ExternalController::new(bt_device);
+    let controller: BleController = ExternalController::new(bt_device);
     let address = Address::random([0xf0, 0x64, 0x1a, 0x05, 0x8f, 0xff]);
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();
-    let host = trouble_host::new(controller, &mut resources).set_random_address(address);
+    // `build()` borrows the stack, so `ble_stack` stays alive — we need a `&` to it to answer
+    // connection-parameter requests (the macOS link-stall fix). Named `ble_stack` to avoid clashing
+    // with the embassy-net Wi-Fi `Stack`.
+    let ble_stack = trouble_host::new(controller, &mut resources).set_random_address(address);
     let Host {
         mut peripheral,
         mut runner,
         ..
-    } = host.build();
+    } = ble_stack.build();
 
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: DEVICE_NAME,
@@ -106,7 +112,7 @@ pub async fn run_setup(
     info!("[improv] setup mode: advertising as {}", DEVICE_NAME);
     match select(
         runner.run(),
-        accept_loop(&mut peripheral, &server, control, stack),
+        accept_loop(&mut peripheral, &server, control, stack, &ble_stack),
     )
     .await
     {
@@ -116,10 +122,11 @@ pub async fn run_setup(
 }
 
 async fn accept_loop(
-    peripheral: &mut Peripheral<'_, ExternalController<BtDriver<'static>, 1>, DefaultPacketPool>,
+    peripheral: &mut Peripheral<'_, BleController, DefaultPacketPool>,
     server: &Server<'_>,
     control: &mut Control<'static>,
     stack: Stack<'static>,
+    ble_stack: &trouble_host::Stack<'_, BleController, DefaultPacketPool>,
 ) -> Ipv4Addr {
     let mut adv_data = [0u8; 31];
     let adv_len = AdStructure::encode_slice(
@@ -163,7 +170,7 @@ async fn accept_loop(
             }
         };
         info!("[improv] client connected");
-        if let Some(ip) = serve_connection(server, &conn, control, stack).await {
+        if let Some(ip) = serve_connection(server, &conn, control, stack, ble_stack).await {
             return ip;
         }
         info!("[improv] client disconnected without provisioning; re-advertising");
@@ -175,6 +182,7 @@ async fn serve_connection<P: PacketPool>(
     conn: &GattConnection<'_, '_, P>,
     control: &mut Control<'static>,
     stack: Stack<'static>,
+    ble_stack: &trouble_host::Stack<'_, BleController, P>,
 ) -> Option<Ipv4Addr> {
     loop {
         match conn.next().await {
@@ -182,6 +190,20 @@ async fn serve_connection<P: PacketPool>(
                 info!("[improv] client disconnected: {:?}", reason);
                 return None;
             }
+            // macOS CoreBluetooth sends a connection-parameter update request right after
+            // connecting; it MUST be answered or the link stalls and the credential write never
+            // arrives (the macOS provisioning bug). Accept the peer's requested params.
+            GattConnectionEvent::RequestConnectionParams(req) => {
+                info!("[improv] connection-params request — accepting");
+                if let Err(e) = req.accept(None, ble_stack).await {
+                    warn!("[improv] failed to accept connection params: {:?}", e);
+                }
+            }
+            GattConnectionEvent::ConnectionParamsUpdated { conn_interval, .. } => {
+                info!("[improv] connection params updated (interval {:?})", conn_interval);
+            }
+            GattConnectionEvent::PhyUpdated { .. } => info!("[improv] phy updated"),
+            GattConnectionEvent::DataLengthUpdated { .. } => info!("[improv] data length updated"),
             GattConnectionEvent::Gatt { event } => {
                 // Acknowledge the GATT op; this also commits a (simple or long) write to the store.
                 if let Ok(reply) = event.accept() {
@@ -198,6 +220,8 @@ async fn serve_connection<P: PacketPool>(
                     }
                 }
             }
+            // The remaining variants only exist with the `security` feature, which we don't enable.
+            #[allow(unreachable_patterns)]
             _ => {}
         }
     }

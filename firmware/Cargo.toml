@@ -36,7 +36,10 @@ embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet"] }
 # trouble 0.7 needs bt-hci 0.9, which cyw43 0.7.0 cannot provide (the BtDriver/ExternalController
 # types wouldn't line up). This pairing forces the embassy-sync split below. See docs/pico-port.md
 # §"Dependency compatibility" for the constraint and how to retire the split on a future upgrade.
-trouble-host = { version = "0.6.0", features = ["default-packet-pool-mtu-255", "derive"] }
+# `connection-params-update`: lets us answer the LE Remote Connection Parameter Request that macOS
+# CoreBluetooth sends right after connecting — required, or the link stalls (the macOS provisioning
+# bug). See src/improv.rs serve_connection + docs/pico-port.md.
+trouble-host = { version = "0.6.0", features = ["default-packet-pool-mtu-255", "derive", "connection-params-update"] }
 
 # Pinned to 0.7 ONLY so the trouble 0.6 #[gatt_server] macro expands against the same embassy-sync
 # version trouble itself was built with (0.7). The rest of the stack (embassy-rp/net/cyw43) uses

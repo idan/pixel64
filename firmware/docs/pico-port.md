@@ -203,16 +203,33 @@ corruption fails the checksum → reject → the client retries). We never accep
 doesn't cover. This makes Android provisioning reliable. *(Candidate for an upstream cyw43/trouble
 bug report; revisit if a cyw43 update changes the BT path.)*
 
-**❌ macOS Chrome still fails — and it's NOT the controller.** macOS Chrome connects, but the
-credential write never reaches the device (`client connected`, then no `received … RPC`; the browser
-spins forever). This is the **identical** symptom we had on the ESP — reproduced here on a *different
-radio* (cyw43). Since the controller changed but the failure didn't, the ESP diagnosis ("esp-radio ↔
-CoreBluetooth link layer") was **incomplete**: the common factors are **trouble-host** (same host
-stack on both boards) and **macOS CoreBluetooth**, so the real cause is more likely trouble's handling
-of macOS's post-connect connection-parameter update / idle link (cf. esp-idf #11280). **Android /
-Windows / Linux Chrome remain the supported provisioning path** (unchanged from the ESP). macOS is
-still open — next probes: enable trouble's `[host]` logging during a macOS attempt to see whether the
-write reaches the link layer at all, and try trouble's `connection-params-update` feature.
+**✅ macOS Chrome — SOLVED; it was a browser SDK bug, never the device.** The Improv JS SDK wrote
+credentials with **`writeValueWithoutResponse()`**. On macOS, Chrome routes that through
+CoreBluetooth's `canSendWriteWithoutResponse` flow-control flag, which sticks `false` (worst right
+after the idle typing window) and **silently drops the write before it ever hits the air** — which
+explains the zero-trace loss, the cross-radio reproduction (it never leaves the Mac, so the
+controller is irrelevant), and the reads-work / write-fails split. This is
+[improv-wifi/sdk-ble-js #213](https://github.com/improv-wifi/sdk-ble-js/issues/213), **fixed upstream
+in PR #217 (Dec 2025)** by switching to `writeValue()` (write *with* response — a different,
+reliable CoreBluetooth path).
+
+**Confirmed on hardware:** our own test client (`web/improv-test/`, write-with-response) provisions
+cleanly from macOS Chrome against the same firmware that `improv-wifi.com` couldn't. **No firmware
+change needed** — the `rpc_command` characteristic already exposes Write (with response). The
+ESP-era "esp-radio ↔ CoreBluetooth link layer" diagnosis (and our own mid-investigation
+link-layer/flow-control hypotheses) were all wrong: Chrome was dropping the write client-side the
+whole time.
+
+The instrumented dead-ends are still worth recording (each was ruled out with evidence): not the
+controller (same on esp-radio + cyw43), not MTU/long-writes (MTU 251, reads fine), not our event
+handling (macOS never sends `RequestConnectionParams`; we keep the handler anyway as correct BLE
+behavior), not host-buffer flow control (trouble 0.6's `SetControllerToHostFlowControl` is commented
+out, so its hardcoded `ACL_N=1` is never enforced). All consistent with the real cause being above
+the device entirely.
+
+**Caveat for end users:** any provisioning UI still shipping the pre-#217 Improv SDK will fail on
+macOS. The fix is to use an updated client — the pixel64 web app will host its own provisioning UI
+using write-with-response (the `web/improv-test/` page is the seed of that).
 
 ## Smaller platform changes
 
@@ -263,10 +280,10 @@ plan.
      GATT patterns ported verbatim (still trouble 0.6).
    - **2c — Spike Risk 2 (concurrency)** ✅ *(done)* — Improv GATT ported (`src/improv.rs`); device
      joins Wi-Fi while the BLE link is up and reports IP back over BLE. Verified end-to-end from
-     Android. Findings above: concurrency works; a cyw43 byte-1 corruption is worked around via
-     checksum reconstruction; **macOS Chrome still fails** (now known to be trouble/CoreBluetooth,
-     not the controller) — still open, Android remains the supported path. Persistence stubbed
-     (storage = M4).
+     Android **and macOS**. Findings above: concurrency works; a cyw43 byte-1 corruption is worked
+     around via checksum reconstruction; **macOS Chrome solved** — it was the Improv SDK's
+     `writeValueWithoutResponse()` (improv-wifi#213, fixed upstream), confirmed via the
+     `web/improv-test/` client; no firmware change. Persistence stubbed (storage = M4).
 3. **Spike Risk 1** — minimal PIO+DMA HUB75 driver lighting the 64×64 panel with a test pattern
    (port the PIO program; prove DMA chain + BCM). The riskiest *build*.
 4. **Port `storage.rs`** — swap flash handle, fixed offset. Smallest, self-contained; do it early.
