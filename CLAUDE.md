@@ -83,3 +83,18 @@ driver test pattern), `cargo run --bin calibrate` (gamma/BCM calibration target)
 refbench` (refresh-rate benchmark), `cargo run --bin scene` (shared shader VM rendering an embedded
 scene on the panel). `cargo build` / `cargo clippy` to check (both currently clean; building the
 firmware emits a harmless `dropping unsupported crate type cdylib` note from the renderer dep).
+
+## Authoring PRs
+
+PR descriptions must be **structured**, never one long paragraph. Always follow this shape:
+
+- **Lead with a root analysis** — a short opening that states the *goal* the PR implements and the
+  problem it solves (the "why" and "what it achieves"), not just a restatement of the title.
+- **Then list the changes as bullets/notes** — concrete, scannable points describing what actually
+  changed, not prose.
+- **Split into logical sections** (with `##`/`###` headings) when the change set has distinct parts
+  (e.g. firmware vs. web vs. renderer, or feature vs. refactor vs. tests/docs). A small single-purpose
+  PR can stay as one analysis paragraph + one bullet list; only add sections when there are genuinely
+  separate concerns.
+- Call out anything reviewers must know: behavior changes, deferred work, follow-ups, manual test
+  steps, and risks/caveats.
