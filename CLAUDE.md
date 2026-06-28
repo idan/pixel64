@@ -33,8 +33,14 @@ tag **`esp32-final`**; the migration story and the verified dependency set live 
   panel; on reboot it rejoins automatically (else re-enters setup). Hold **BOOTSEL ~3 s** while
   running = factory reset (wipe creds, reboot to setup). Bad creds fail fast (length-validated +
   join timeout) with a `FAILED` screen — never a hang.
-- ⏳ **Open (polish, non-blocking)** — BCM color-depth tuning for smooth gradients (solid-color text
-  is fine); building out the `web/` app (scaffolded; UI/backend still TBD).
+- ✅ **Color calibration** — perceptual gamma LUT + BCM tuning dialed in on the panel (`GAMMA=2.2`,
+  `B=10`, `OE_DIV=8`); gradients read evenly. Tools: `cargo run --bin calibrate` / `--bin refbench`.
+- ✅ **Renderer on-device (MVP)** — the shared `renderer/` shader VM is wired into the firmware
+  (`src/scene.rs`, `cargo run --bin scene`) and animates an embedded scene on the panel via the same
+  `render_grid` the web preview uses. **Deferred** (see docs/scenes/device-runtime.md): flash scene
+  store, network delivery, multi-layer compositor, live-input uniforms, core-1 offload, sin/cos LUT.
+- ⏳ **Open** — building out the `web/` app (scaffolded; UI/backend still TBD) and the scene
+  store/transport that feeds real scenes to the device.
 
 ## Read before working
 
@@ -67,6 +73,13 @@ tag **`esp32-final`**; the migration story and the verified dependency set live 
 
 From **`firmware/`**: `cargo run` builds + flashes the firmware over USB via **`picotool`** (hold
 **BOOTSEL** while plugging in; `picotool` is a Homebrew install — no debug probe needed). Logs come
-back over **USB-serial** (`screen /dev/tty.usbmodem*` — the lower-numbered data interface).
+back over **USB-serial**: use **`tio /dev/cu.usbmodem*`** (`brew install tio`; Ctrl-T then Q to
+quit). Use the **`cu.`** device, not `tty.` — the `tty.` call-in device blocks on carrier-detect a USB
+CDC port never asserts, and a hung `tty.` monitor will hold the port ("resource busy" / "could not
+find a PTY"); free it with `screen -wipe` / kill the stuck process. macOS's bundled `screen` (v4, 2006)
+is buggy here — prefer `tio`. (`cu` hits uucp-lock permission errors.)
 Diagnostics: `cargo run --bin firstlight` (bit-bang wiring test), `cargo run --bin hub75test` (PIO
-driver test pattern). `cargo build` / `cargo clippy` to check (both currently clean).
+driver test pattern), `cargo run --bin calibrate` (gamma/BCM calibration target), `cargo run --bin
+refbench` (refresh-rate benchmark), `cargo run --bin scene` (shared shader VM rendering an embedded
+scene on the panel). `cargo build` / `cargo clippy` to check (both currently clean; building the
+firmware emits a harmless `dropping unsupported crate type cdylib` note from the renderer dep).

@@ -5,13 +5,22 @@ edition = "2021"
 description = "Shared scene renderer (shader VM + compositor) for pixel64 — compiles to wasm32 (web preview) and the device target."
 
 [lib]
-# cdylib for the wasm build; rlib so firmware can depend on it later.
+# cdylib for the wasm build; rlib so the firmware can depend on it (it does — firmware/src/scene.rs).
+# Building the firmware emits a harmless "dropping unsupported crate type `cdylib`" warning: cargo
+# can't make a cdylib for the MCU target, so it uses the rlib — which is exactly what we want.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# `wasm` (default) pulls in wasm-bindgen + std for the web preview's `Program` wrapper. The firmware
+# depends with `default-features = false` → the crate is `no_std` (core VM only, no heap, no bindgen).
+default = ["wasm"]
+wasm = ["dep:wasm-bindgen"]
+
 [dependencies]
-wasm-bindgen = "0.2"
+wasm-bindgen = { version = "0.2", optional = true }
 # Transcendentals via libm: f32::sin/cos/etc. have no implementation on
-# wasm32-unknown-unknown (no system libm) and would fail to link.
+# wasm32-unknown-unknown (no system libm) and would fail to link; on the device the same libm keeps
+# the preview and device bit-comparable.
 libm = "0.2"
 
 [profile.release]

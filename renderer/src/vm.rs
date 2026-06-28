@@ -147,6 +147,148 @@ fn noise3(px: f32, py: f32, pz: f32) -> f32 {
     lerp(z0, z1, fz)
 }
 
+// ---- fast f32 transcendentals ----
+//
+// `libm::sinf`/`cosf` do their range reduction in `f64`; the RP2350's Cortex-M33 FPU is
+// single-precision-only, so that `f64` is software-emulated (~3000 cycles/call) and dominated the
+// per-pixel cost on-device. These are pure-`f32` polynomial approximations: range-reduce to
+// [-π/2, π/2], then a degree-9 odd Taylor (Horner). Max error ~1e-6 — far under the 1/255 output
+// quantization. They use only IEEE-754 f32 +,-,* (no fused multiply-add), so Rust on ARM and on
+// wasm yield identical bits → device and preview agree by construction.
+//
+// (The VM spec, docs/scenes/shader-vm.md, called for a sine *LUT*. A polynomial meets the same goals
+// — f64-free, fast, deterministic — with no table to ship and better accuracy, so we use it instead.)
+
+/// Fast pure-`f32` sine. See module note above.
+#[inline]
+pub fn fast_sin(x: f32) -> f32 {
+    use core::f32::consts::{PI, TAU};
+    const HALF_PI: f32 = PI * 0.5;
+    // Reduce to [-π, π], then fold into [-π/2, π/2] where the polynomial is accurate.
+    let mut r = x - TAU * libm::roundf(x / TAU);
+    if r > HALF_PI {
+        r = PI - r;
+    } else if r < -HALF_PI {
+        r = -PI - r;
+    }
+    let r2 = r * r;
+    r * (1.0
+        + r2 * (-1.0 / 6.0
+            + r2 * (1.0 / 120.0 + r2 * (-1.0 / 5040.0 + r2 * (1.0 / 362880.0)))))
+}
+
+/// Fast pure-`f32` cosine, via `fast_sin(x + π/2)`.
+#[inline]
+pub fn fast_cos(x: f32) -> f32 {
+    fast_sin(x + core::f32::consts::FRAC_PI_2)
+}
+
+// ---- the operand stack (fixed-capacity, no alloc) ----
+
+/// Operand-stack capacity. The VM spec bounds max stack depth and the web compiler enforces it, so
+/// this only needs to cover legal programs; overflowing pushes are dropped defensively. Fixed-size so
+/// the VM runs `no_std` on the device with no heap (and identically in the wasm preview).
+pub const STACK_CAP: usize = 64;
+
+/// The `f32` operand stack — a fixed array + top index. `pop`/`last` return `0.0` on underflow and
+/// `push` is a no-op on overflow, matching the previous `unwrap_or(0.0)` / capacity behaviour so a
+/// malformed program degrades instead of panicking.
+pub struct Stack {
+    buf: [f32; STACK_CAP],
+    top: usize,
+}
+
+impl Stack {
+    pub const fn new() -> Self {
+        Self { buf: [0.0; STACK_CAP], top: 0 }
+    }
+    #[inline]
+    fn clear(&mut self) {
+        self.top = 0;
+    }
+    #[inline]
+    fn push(&mut self, v: f32) {
+        if self.top < STACK_CAP {
+            self.buf[self.top] = v;
+            self.top += 1;
+        }
+    }
+    #[inline]
+    fn pop(&mut self) -> f32 {
+        if self.top > 0 {
+            self.top -= 1;
+            self.buf[self.top]
+        } else {
+            0.0
+        }
+    }
+    #[inline]
+    fn last(&self) -> f32 {
+        if self.top > 0 { self.buf[self.top - 1] } else { 0.0 }
+    }
+    #[inline]
+    fn swap_top2(&mut self) {
+        if self.top >= 2 {
+            self.buf.swap(self.top - 1, self.top - 2);
+        }
+    }
+}
+
+impl Default for Stack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Clamp a linear `0..1` channel to an 8-bit value. Shared by the wasm preview and the device so both
+/// quantize identically (`+0.5` rounds to nearest).
+#[inline]
+pub fn to_u8(x: f32) -> u8 {
+    (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+/// Render one frame over a `res × res` grid: run the per-frame block once (writing frame-global
+/// `slots`), then the per-pixel block at every cell, calling `emit(x, y, &rgba)` with the four output
+/// slots. The caller fills the reserved built-in uniforms `0..3` and any bound inputs `10..`; this
+/// fills the per-pixel uniforms `4..9`. `slots`/`stack` are caller-owned scratch (no allocation).
+/// This is the single render path shared by the wasm preview and the device — same pixels both places.
+#[allow(clippy::too_many_arguments)]
+pub fn render_grid(
+    frame: &[u32],
+    pixel: &[u32],
+    constants: &[f32],
+    slots: &mut [f32],
+    stack: &mut Stack,
+    uniforms: &mut [f32],
+    res: usize,
+    mut emit: impl FnMut(usize, usize, &[f32; 4]),
+) {
+    // Frame-globals start clean each frame.
+    for s in slots.iter_mut() {
+        *s = 0.0;
+    }
+    let mut out = [0.0f32; 4];
+    run(frame, constants, uniforms, slots, stack, &mut out);
+
+    let inv = 1.0 / res as f32;
+    for y in 0..res {
+        for x in 0..res {
+            let uvx = (x as f32 + 0.5) * inv;
+            let uvy = (y as f32 + 0.5) * inv;
+            uniforms[4] = x as f32;
+            uniforms[5] = y as f32;
+            uniforms[6] = uvx;
+            uniforms[7] = uvy;
+            uniforms[8] = (uvx - 0.5) * 2.0;
+            uniforms[9] = (uvy - 0.5) * 2.0;
+
+            out = [0.0; 4];
+            run(pixel, constants, uniforms, slots, stack, &mut out);
+            emit(x, y, &out);
+        }
+    }
+}
+
 // ---- the interpreter ----
 
 /// Executes one bytecode block. `stack` and `out` are scratch the caller owns so
@@ -158,7 +300,7 @@ pub fn run(
     constants: &[f32],
     uniforms: &[f32],
     slots: &mut [f32],
-    stack: &mut Vec<f32>,
+    stack: &mut Stack,
     out: &mut [f32; 4],
 ) {
     stack.clear();
@@ -174,22 +316,17 @@ pub fn run(
             op::LOAD_UNIFORM => stack.push(uniforms[arg as usize]),
             op::LOAD_SLOT => stack.push(slots[arg as usize]),
             op::STORE_SLOT => {
-                let v = stack.pop().unwrap_or(0.0);
+                let v = stack.pop();
                 slots[arg as usize] = v;
             }
             op::DUP => {
-                let v = *stack.last().unwrap_or(&0.0);
+                let v = stack.last();
                 stack.push(v);
             }
             op::POP => {
                 stack.pop();
             }
-            op::SWAP => {
-                let len = stack.len();
-                if len >= 2 {
-                    stack.swap(len - 1, len - 2);
-                }
-            }
+            op::SWAP => stack.swap_top2(),
             op::ADD => bin(stack, |a, b| a + b),
             op::SUB => bin(stack, |a, b| a - b),
             op::MUL => bin(stack, |a, b| a * b),
@@ -201,31 +338,31 @@ pub fn run(
             op::CEIL => un(stack, libm::ceilf),
             op::FRACT => un(stack, fract),
             op::SIGN => un(stack, |a| if a > 0.0 { 1.0 } else if a < 0.0 { -1.0 } else { 0.0 }),
-            op::SQRT => un(stack, |a| a.sqrt()),
+            op::SQRT => un(stack, libm::sqrtf),
             op::MIN => bin(stack, |a, b| a.min(b)),
             op::MAX => bin(stack, |a, b| a.max(b)),
             op::CLAMP => {
-                let hi = stack.pop().unwrap_or(0.0);
-                let lo = stack.pop().unwrap_or(0.0);
-                let x = stack.pop().unwrap_or(0.0);
+                let hi = stack.pop();
+                let lo = stack.pop();
+                let x = stack.pop();
                 stack.push(x.max(lo).min(hi));
             }
             op::MIX => {
-                let t = stack.pop().unwrap_or(0.0);
-                let b = stack.pop().unwrap_or(0.0);
-                let a = stack.pop().unwrap_or(0.0);
+                let t = stack.pop();
+                let b = stack.pop();
+                let a = stack.pop();
                 stack.push(a + (b - a) * t);
             }
             op::STEP => bin(stack, |edge, x| if x < edge { 0.0 } else { 1.0 }),
             op::SMOOTHSTEP => {
-                let x = stack.pop().unwrap_or(0.0);
-                let e1 = stack.pop().unwrap_or(0.0);
-                let e0 = stack.pop().unwrap_or(0.0);
+                let x = stack.pop();
+                let e1 = stack.pop();
+                let e0 = stack.pop();
                 let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
                 stack.push(t * t * (3.0 - 2.0 * t));
             }
-            op::SIN => un(stack, libm::sinf),
-            op::COS => un(stack, libm::cosf),
+            op::SIN => un(stack, fast_sin),
+            op::COS => un(stack, fast_cos),
             op::TAN => un(stack, libm::tanf),
             op::ATAN2 => bin(stack, libm::atan2f),
             op::EXP => un(stack, libm::expf),
@@ -234,9 +371,9 @@ pub fn run(
             op::HASH => un(stack, hash1),
             op::NOISE2 => bin(stack, noise2),
             op::NOISE3 => {
-                let z = stack.pop().unwrap_or(0.0);
-                let y = stack.pop().unwrap_or(0.0);
-                let x = stack.pop().unwrap_or(0.0);
+                let z = stack.pop();
+                let y = stack.pop();
+                let x = stack.pop();
                 stack.push(noise3(x, y, z));
             }
             op::LT => bin(stack, |a, b| (a < b) as i32 as f32),
@@ -249,20 +386,20 @@ pub fn run(
             op::OR => bin(stack, |a, b| ((a != 0.0) || (b != 0.0)) as i32 as f32),
             op::NOT => un(stack, |a| (a == 0.0) as i32 as f32),
             op::SELECT => {
-                let c = stack.pop().unwrap_or(0.0);
-                let b = stack.pop().unwrap_or(0.0);
-                let a = stack.pop().unwrap_or(0.0);
+                let c = stack.pop();
+                let b = stack.pop();
+                let a = stack.pop();
                 stack.push(if c != 0.0 { a } else { b });
             }
             op::JMP => ip = arg as usize,
             op::JMP_IF_ZERO => {
-                let c = stack.pop().unwrap_or(0.0);
+                let c = stack.pop();
                 if c == 0.0 {
                     ip = arg as usize;
                 }
             }
             op::STORE_OUT => {
-                let v = stack.pop().unwrap_or(0.0);
+                let v = stack.pop();
                 out[arg as usize] = v;
             }
             _ => {} // unknown opcode: skip
@@ -271,13 +408,13 @@ pub fn run(
 }
 
 #[inline]
-fn un(stack: &mut Vec<f32>, f: impl Fn(f32) -> f32) {
-    let a = stack.pop().unwrap_or(0.0);
+fn un(stack: &mut Stack, f: impl Fn(f32) -> f32) {
+    let a = stack.pop();
     stack.push(f(a));
 }
 #[inline]
-fn bin(stack: &mut Vec<f32>, f: impl Fn(f32, f32) -> f32) {
-    let b = stack.pop().unwrap_or(0.0);
-    let a = stack.pop().unwrap_or(0.0);
+fn bin(stack: &mut Stack, f: impl Fn(f32, f32) -> f32) {
+    let b = stack.pop();
+    let a = stack.pop();
     stack.push(f(a, b));
 }

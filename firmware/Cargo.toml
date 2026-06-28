@@ -35,6 +35,12 @@ cyw43-pio = "0.10.0"
 pio               = "0.3"
 fixed             = "1"
 embedded-graphics = "0.8"
+# powf for the boot-built perceptual gamma LUT (src/hub75.rs); no_std float math.
+libm              = "0.2"
+
+# Shared scene renderer (shader-bytecode VM). `default-features = false` selects the no_std, no-heap
+# core (no wasm-bindgen) — the same VM the web preview runs, so device output matches by construction.
+pixel64-renderer  = { path = "../renderer", default-features = false }
 
 # IP stack for the Wi-Fi station (DHCP to confirm a working connection + obtain the IP).
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "medium-ethernet"] }
@@ -78,6 +84,16 @@ static_cell      = "2.1"
 [profile.dev]
 # Some optimization even in dev: the default debug profile is too slow/big for the MCU.
 opt-level = "s"
+
+# The shader VM is a hot per-pixel interpreter — always build it for speed (no bounds/overflow checks,
+# full opt) even in dev, so `cargo run --bin scene` is usable. Size is a non-issue for one small crate.
+[profile.dev.package.pixel64-renderer]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
+[profile.release.package.pixel64-renderer]
+opt-level = 3
 
 [profile.release]
 codegen-units = 1

@@ -19,6 +19,24 @@ export const isVec = (v: Value): v is number[] => Array.isArray(v);
 
 const TAU = Math.PI * 2;
 
+// Fast sine, mirroring renderer/src/vm.rs::fast_sin so this reference matches the Rust→WASM renderer.
+// The renderer replaced libm's sinf (which range-reduces in f64 — catastrophic on the device's
+// single-precision FPU) with this degree-9 odd-Taylor approximation over [-π/2, π/2]. Keeping the
+// same polynomial here keeps the editor's WASM-vs-TS parity exact on sin/cos scenes. See
+// docs/scenes/shader-vm.md. (Evaluated in f64 here vs f32 on device/WASM — that gap is far under the
+// 1/255 output quantization, as for every other op in this reference.)
+const HALF_PI = Math.PI / 2;
+// Round half away from zero, matching Rust's libm::roundf (JS Math.round rounds half toward +∞).
+const roundTiesAway = (x: number) => Math.sign(x) * Math.round(Math.abs(x));
+function fastSin(x: number): number {
+	let r = x - TAU * roundTiesAway(x / TAU);
+	if (r > HALF_PI) r = Math.PI - r;
+	else if (r < -HALF_PI) r = -Math.PI - r;
+	const r2 = r * r;
+	return r * (1 + r2 * (-1 / 6 + r2 * (1 / 120 + r2 * (-1 / 5040 + r2 * (1 / 362880)))));
+}
+const fastCos = (x: number): number => fastSin(x + HALF_PI);
+
 /** Coerce to a scalar, erroring on vectors. */
 export function asScalar(v: Value, what = 'value'): number {
 	if (isVec(v)) throw new RuntimeError(`Expected a scalar ${what}, got a vec${v.length}`);
@@ -90,7 +108,7 @@ const palette = (t: number, a?: Value, b?: Value, c?: Value, d?: Value): number[
 	const B = (b as number[]) ?? [0.5, 0.5, 0.5];
 	const C = (c as number[]) ?? [1.0, 1.0, 1.0];
 	const D = (d as number[]) ?? [0.0, 0.33, 0.67];
-	return [0, 1, 2].map((i) => A[i] + B[i] * Math.cos(TAU * (C[i] * t + D[i])));
+	return [0, 1, 2].map((i) => A[i] + B[i] * fastCos(TAU * (C[i] * t + D[i])));
 };
 
 const hsv = (h: number, s: number, v: number): number[] => {
@@ -216,9 +234,10 @@ export const BUILTINS: Record<string, Fn> = {
 			a[2]
 		),
 
-	// trig (LUT-backed on device; plain Math here)
-	sin: s1(Math.sin),
-	cos: s1(Math.cos),
+	// trig — sin/cos use the same fast polynomial as the renderer (see fastSin above) so preview and
+	// device agree; tan/atan still use Math (renderer keeps libm for those).
+	sin: s1(fastSin),
+	cos: s1(fastCos),
 	tan: s1(Math.tan),
 	atan: (a) => (a.length === 2 ? Math.atan2(asScalar(a[0]), asScalar(a[1])) : map1(Math.atan, a[0])),
 

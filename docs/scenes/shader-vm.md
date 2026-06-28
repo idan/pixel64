@@ -76,8 +76,16 @@ primitives ([shader-language.md](shader-language.md)). The dedicated opcodes:
 
 ### Transcendentals & LUTs
 
-- **`SIN`/`COS`/`TAN`/`ATAN2` are LUT-backed** (LOCKED). A shared sine table (e.g. 1024 entries +
-  linear interpolation) lives in flash; the *same* table ships in the WASM preview so both agree.
+- **`SIN`/`COS` use a pure-`f32` polynomial** (REVISED from the original LUT decision). `libm::sinf`
+  range-reduces in `f64`, and the RP2350's Cortex-M33 FPU is **single-precision only** → that `f64` is
+  software-emulated (~3,000 cycles/call) and dominated on-device rendering (measured: 280 ms/frame, of
+  which `sin` was the bulk). A degree-9 odd-Taylor approximation over `[-π/2, π/2]`
+  (`renderer/src/vm.rs::fast_sin`) is ~20 cycles, ~1e-6 error (far under 1/255), and uses only IEEE
+  `f32` +,−,× (no FMA) so device and WASM produce **identical bits** — same goals as the LUT (f64-free,
+  fast, deterministic) with no table to ship and better accuracy. The web TS parity-reference
+  (`web/src/lib/scene/builtins.ts`) uses the same polynomial, so the editor's WASM-vs-TS harness stays
+  green on `sin`/`cos` scenes.
+- **`TAN`/`ATAN2` still use `libm`** (rare per-pixel); promote to `fast_*` if they ever show up hot.
 - **DECISION: `EXP`/`LOG`/`POW` use `libm` (`f32`) initially**, not LUTs. They're rarer per-pixel and
   the FPU makes them tolerable; promote to LUTs only if profiling says so. (Parity note: `libm`
   results may differ by a few ULP between native and WASM — within our visual tolerance,

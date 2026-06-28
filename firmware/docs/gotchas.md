@@ -23,6 +23,25 @@ upgrade-evaluation recipe in [pico-port.md](pico-port.md).
 - **Target is ARM** (`thumbv8m.main-none-eabihf`). The RP2350's RISC-V cores aren't supported by
   embassy-rp.
 
+## USB-serial logging (silent logs)
+
+- **A busy-loop with no `.await` starves the USB logger — logs go silent.** The executor is
+  cooperative + single-threaded (`executor-thread`); `embassy-usb-logger` runs as a *separate task*
+  that only drains its buffer when the executor gets to poll it. A task that loops without ever
+  awaiting (e.g. a tight measurement/poll loop) never yields, so the logger never runs: the USB port
+  stays *connected* (the hardware just NAKs) but emits **nothing**. Fix: `Timer::after(..).await`
+  periodically so the logger can flush. (This bit `bin/refbench` — it busy-polls to count frames, so
+  it measures in short windows and yields between them.)
+- **Host side: use `tio /dev/cu.usbmodem*`, not `screen /dev/tty.*`.** The `tty.` *call-in* device
+  blocks on carrier-detect a USB-CDC port never asserts ("could not find a PTY"); a hung `tty.`
+  monitor then holds the port so the next open gets **"resource busy"** (clear it: `screen -wipe`, or
+  `lsof /dev/cu.usbmodem*` then kill the stuck PID). macOS's bundled `screen` (v4, 2006) is buggy
+  here and `cu` hits uucp-lock permission errors — `brew install tio` and use that (Ctrl-T then Q).
+- **Through a dock/hub you may see two `cu.usbmodem*` nodes and no data.** A single CDC should be one
+  node; a second (often a stale ghost from the previous firmware the hub never tore down) and a
+  connect-but-silent port point at the USB path, not the firmware. The logs are on the **lower-numbered**
+  interface — but if it stays silent, plug the Pico **directly** into the machine and re-enumerate.
+
 ## Display / HUB75 subtleties
 
 - **RP2350 PIO pins don't reset to RP2040 defaults — set pin dirs explicitly.** The driver calls
@@ -33,9 +52,14 @@ upgrade-evaluation recipe in [pico-port.md](pico-port.md).
 - **The image is 180° from the draw origin.** The driver carries hub75-pio's un-mirror convention
   (`mov pins, ~x` + `W-1-x`/`H-1-y`). The panel is square / free-orientation — **rotate it to suit**
   rather than fighting the code.
-- **BCM color depth has an LSB floor.** A bit-plane can't display for less than the pixel-shift time,
-  so low planes are floored and the bright end of a gradient saturates. For smooth gradients, raise
-  `OE_DIV` and add a gamma LUT (see [performance.md](performance.md)). Solid-color text is unaffected.
+- **Gradients need perceptual gamma.** LEDs emit ~linearly in the BCM code but the eye doesn't, so a
+  raw linear ramp crushes into the darks. `set_pixel` now runs each channel through `gamma_lut`;
+  endpoints are identity so solid text is unaffected. Dialed in on the panel to `GAMMA = 2.2`,
+  `B = 10`, `OE_DIV = 8` (at `B = 8` the darks band; `OE_DIV = 8` also makes the panel ~3× brighter
+  than `OE_DIV = 1`). Re-tune with `cargo run --bin calibrate`. Note the coupling: tiny low-plane
+  windows fall below the driver's linear pulse-response, so raising `OE_DIV` both brightens *and*
+  improves dark-end fidelity — which is why gamma landed at the sRGB-standard 2.2 here rather than the
+  1.8 it needed at `OE_DIV = 1`. See [performance.md](performance.md).
 - **HUB75 column ghosting follows the drawn color** (a bright pixel casts a faint tint in the column
   below). Normal HUB75 OE/latch timing, **not a code bug**.
 - **The DMA chain is hand-rolled against `embassy_rp::pac`.** embassy's safe DMA API doesn't expose

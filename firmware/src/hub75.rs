@@ -5,7 +5,8 @@
 //! DMA loop**, so the panel refreshes forever with no CPU involvement — which is also the fix for
 //! the ESP build's flicker (refresh is fully decoupled from the radio). Color depth is **binary code
 //! modulation (BCM)**: each of `B` bit-planes is displayed for `2^i − 1` ticks via the OE state
-//! machine.
+//! machine. Channel values pass through a **perceptual gamma LUT** ([`gamma_lut`]) on the way into
+//! the framebuffer so equal-step ramps read as even brightness bands (see [`GAMMA`]).
 //!
 //! Differences from upstream: fixed dimensions (no `generic_const_exprs` nightly feature), embassy's
 //! PIO `Config` API, and the DMA chain written against `embassy_rp::pac` (embassy's safe DMA API
@@ -33,18 +34,24 @@ use fixed::types::extra::U8;
 pub const W: usize = 64;
 pub const H: usize = 64;
 /// Bit-planes (color depth per channel). More = richer color but slower refresh + more RAM.
-pub const B: usize = 8;
+pub const B: usize = 10;
 /// Address lines (1/32 scan = 5: A–E).
 pub const ADDR_PINS: usize = 5;
+/// Perceptual gamma applied to every channel in [`Display::set_pixel`] (see [`gamma_lut`]). The
+/// panel emits light ~linearly in the BCM code, but the eye is non-linear, so without this an
+/// equal-step ramp crushes into the dark end and the bright end looks flat. `2.2` ≈ sRGB; raise for
+/// more contrast, lower toward `1.0` to flatten (`1.0` = off / raw linear light). Calibrate on the
+/// panel with `cargo run --bin calibrate`.
+pub const GAMMA: f32 = 2.2;
 /// Framebuffer bytes: one tuple byte per pixel of the active half, × B planes.
 const FB_BYTES: usize = W * H / 2 * B;
 
 // Clock dividers (sys_clk ≈ 150 MHz). Data /4 ≈ 18.75 MHz pixel clock (conservative, matches the
 // ESP's proven 20 MHz). Row/OE near full speed; OE divider scales the BCM dwell — tune for
 // brightness/color once lit.
-const DATA_DIV: u16 = 4;
+pub const DATA_DIV: u16 = 4;
 const ROW_DIV: u16 = 1;
-const OE_DIV: u16 = 1;
+pub const OE_DIV: u16 = 8;
 
 // DMA channels (must match the Peris passed to `new`). cyw43 owns PIO0 + DMA_CH0/CH1.
 const FB_CH: usize = 2;
@@ -61,6 +68,24 @@ const fn delays() -> [u32; B] {
         i += 1;
     }
     arr
+}
+
+/// Build the perceptual gamma LUT mapping an 8-bit encoded channel (`0..=255`, as embedded-graphics
+/// delivers) to a linear-light BCM code in `0..=2^B-1`. Output is `(in/255)^gamma · (2^B-1)`.
+/// Endpoints are identity-ish (`0→0`, `255→max`), so solid-color content (status text/UI) is
+/// unaffected — only intermediate levels move. Built once at startup; see [`GAMMA`].
+///
+/// Note the dark-end cost: with `B = 8` a `2.2` curve maps the lowest ~20 inputs all to `0`, so deep
+/// gradients lose resolution. If darks band, raise `B` (e.g. `10`–`11`) for headroom — cheap on the
+/// RP2350 (RAM is `2·64·64/2·B` bytes) and refresh stays well above flicker (see performance.md).
+fn gamma_lut(gamma: f32) -> [u16; 256] {
+    let max = ((1u32 << B) - 1) as f32;
+    let mut lut = [0u16; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let norm = i as f32 / 255.0;
+        *slot = (libm::powf(norm, gamma) * max + 0.5) as u16;
+    }
+    lut
 }
 
 /// Backing storage for the framebuffers + DMA reload pointers. Lives in a `StaticCell`.
@@ -128,6 +153,8 @@ fn div(n: u16) -> FixedU32<U8> {
 /// `commit()` flips. The DMA/PIO refresh runs forever in hardware.
 pub struct Display {
     mem: &'static mut DisplayMemory,
+    /// Perceptual gamma LUT (8-bit channel → BCM code), built from [`GAMMA`] at construction.
+    lut: [u16; 256],
     // Held to keep the PIO + DMA hardware alive for the life of the program.
     _common: Common<'static, PIO1>,
     _data_sm: StateMachine<'static, PIO1, 0>,
@@ -304,6 +331,7 @@ impl Display {
 
         Self {
             mem,
+            lut: gamma_lut(GAMMA),
             _common: common,
             _data_sm: data_sm,
             _row_sm: row_sm,
@@ -316,6 +344,14 @@ impl Display {
 
     fn fb_loop_busy(&self) -> bool {
         pac::DMA.ch(FB_LOOP_CH).ctrl_trig().read().busy()
+    }
+
+    /// Read-only refresh probe (for `bin/refbench`). The framebuffer DMA streams the whole active
+    /// buffer once per refreshed frame, so its read address ramps from the buffer base to the end
+    /// and resets each frame. Counting wrap-arounds (a drop in this value) over a known interval
+    /// yields the measured refresh rate. Has no effect on the running display.
+    pub fn fb_read_addr(&self) -> u32 {
+        pac::DMA.ch(FB_CH).read_addr().read()
     }
 
     /// Flip the buffers. Call after drawing a frame into the inactive buffer; this makes it live and
@@ -338,10 +374,10 @@ impl Display {
         let x = W - 1 - x;
         let y = H - 1 - y;
         let shift = if y > H / 2 - 1 { 3 } else { 0 }; // bottom half -> bits 3..5
-        // Map 8-bit channels down to B bit-planes.
-        let cr = (color.r() >> (8 - B as u8)) as u16;
-        let cg = (color.g() >> (8 - B as u8)) as u16;
-        let cb = (color.b() >> (8 - B as u8)) as u16;
+        // Perceptual gamma + map 8-bit channels to the B-bit BCM code range (see `gamma_lut`).
+        let cr = self.lut[color.r() as usize];
+        let cg = self.lut[color.g() as usize];
+        let cb = self.lut[color.b() as usize];
         let base = x + (y % (H / 2)) * W * B;
         let fb = if self.mem.fbptr[0] == self.mem.fb0.as_ptr() as u32 {
             &mut self.mem.fb1

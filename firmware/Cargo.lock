@@ -1067,6 +1067,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1322,11 +1328,20 @@ dependencies = [
  "embedded-graphics",
  "fixed",
  "heapless 0.9.3",
+ "libm",
  "log",
  "pio",
+ "pixel64-renderer",
  "sequential-storage",
  "static_cell",
  "trouble-host",
+]
+
+[[package]]
+name = "pixel64-renderer"
+version = "0.0.0"
+dependencies = [
+ "libm",
 ]
 
 [[package]]

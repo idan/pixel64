@@ -4,11 +4,21 @@ The **shared** scene renderer: a small stack VM that executes shader **bytecode*
 into a 64×64 premultiplied-RGBA framebuffer. This is the "one renderer, two build
 targets" the architecture calls for ([docs/scenes/preview-and-parity.md](../docs/scenes/preview-and-parity.md)):
 
-- **`wasm32-unknown-unknown`** → the `web/` editor preview (live now).
-- **the device target** → firmware, above the framebuffer seam (future).
+- **`wasm32-unknown-unknown`** (default `wasm` feature) → the `web/` editor preview (live now).
+- **the device target** (`default-features = false` → `no_std`, no heap) → firmware, above the
+  framebuffer seam. **Live now** — the firmware depends on this crate and renders an embedded scene
+  on the panel via [`firmware/src/scene.rs`](../firmware/src/scene.rs) (`cargo run --bin scene`).
 
-Because the same Rust runs both places, the preview matches the device *by
-construction* — not by maintaining a parallel reimplementation.
+Because the same Rust runs both places — both call the shared [`render_grid`](src/vm.rs) over the
+identical VM — the preview matches the device *by construction*, not by a parallel reimplementation.
+
+## no_std / two-target layout
+
+The core VM ([`src/vm.rs`](src/vm.rs)) is `no_std` and allocation-free: the operand stack is a
+fixed-capacity [`Stack`] (array + top index), not a `Vec`, so it runs on the device with no heap and
+identically in the browser. The wasm-bindgen [`Program`](src/program.rs) wrapper (which owns bytecode
+and returns an RGBA `Vec`) lives behind the default `wasm` feature; with `default-features = false`
+only the `no_std` core compiles.
 
 ## Layout
 
@@ -56,8 +66,14 @@ is the next step ([docs/scenes/preview-and-parity.md](../docs/scenes/preview-and
 
 ## Status / shortcuts
 
-- Uses `std` (via wasm-bindgen) for now; structured to go `no_std` + `alloc` for
-  the device. Transcendentals use `libm` (no system libm on `wasm32`).
-- `sin`/`cos` use `libm`, not yet the **LUT** the device spec locks — promote when
-  wiring the device target.
-- Single shader layer only — no multi-layer compositor / blend modes yet.
+- **`no_std`-ready and running on-device** (fixed-capacity stack, no heap); the wasm `Program` is
+  feature-gated. Most transcendentals use `libm` (no system libm on `wasm32`).
+- **`sin`/`cos` use a pure-`f32` polynomial** (`vm::fast_sin`), not `libm` and not the LUT the spec
+  originally locked: `libm::sinf` range-reduces in `f64`, which the device's single-precision FPU
+  software-emulates (~3000 cyc) and dominated on-device frame time. The polynomial is ~20 cyc and uses
+  only IEEE f32 +,−,× → device and WASM agree bit-for-bit. The web TS parity-reference
+  (`web/src/lib/scene/builtins.ts`) uses the same polynomial, so the editor's WASM-vs-TS harness stays
+  exact on `sin`/`cos` scenes.
+- `tan`/`atan2`/`exp`/`log`/`pow` still use `libm` (rare per-pixel).
+- Single shader layer only — no multi-layer compositor / blend modes yet, and no gas budget on the
+  interpreter (the device's embedded scene is trusted; gas comes with untrusted/network bundles).

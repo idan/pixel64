@@ -80,8 +80,10 @@ cargo build / cargo clippy     # check (both clean)
 Hold **BOOTSEL** while plugging in so the board enters its ROM bootloader, then `cargo run` flashes
 via `picotool` (Homebrew install; **not** `elf2uf2-rs` — that emits the RP2040 UF2 family id, which
 the RP2350 rejects). Logs come back over **USB-serial** on the same cable (`embassy-usb-logger`):
-`screen /dev/tty.usbmodem*` (the lower-numbered data interface). No probe needed; a debug probe is an
-optional upgrade (swap the runner to `probe-rs run --chip RP235x`).
+`tio /dev/cu.usbmodem*` (`brew install tio`; Ctrl-T then Q to quit). Use the **`cu.`** device, not
+`tty.` — `tty.` blocks on carrier-detect a CDC port never asserts (a hung `tty.` monitor holds the
+port → "resource busy"; clear with `screen -wipe` / kill it). The bundled `screen` (v4) is buggy here.
+No probe needed; a debug probe is an optional upgrade (swap the runner to `probe-rs run --chip RP235x`).
 
 ## First-light test pattern
 
